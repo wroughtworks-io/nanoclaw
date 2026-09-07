@@ -100,6 +100,24 @@ export function sqliteGetMessageIn(id: string): MessageInRow | undefined {
   }
 }
 
+export function sqliteGetLatestInboundRoute(
+  channelType: string,
+  platformId: string,
+): { id: string; thread_id: string | null } | undefined {
+  const inbound = openInboundDb();
+  try {
+    return inbound
+      .prepare(
+        `SELECT id, thread_id FROM messages_in
+          WHERE channel_type = ? AND platform_id = ?
+          ORDER BY seq DESC LIMIT 1`,
+      )
+      .get(channelType, platformId) as { id: string; thread_id: string | null } | undefined;
+  } finally {
+    inbound.close();
+  }
+}
+
 export function sqliteFindQuestionResponse(questionId: string): MessageInRow | undefined {
   const inbound = openInboundDb();
   try {

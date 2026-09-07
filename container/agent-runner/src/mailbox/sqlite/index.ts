@@ -1,6 +1,5 @@
 import {
   closeSessionDb,
-  getInboundDb,
   sqliteClearContainerToolInFlight,
   sqliteClearStaleProcessingAcks,
   sqliteSetContainerToolInFlight,
@@ -12,8 +11,9 @@ import {
   sqliteFindCliResponse,
   sqliteFindQuestionResponse,
   sqliteGetAllDestinations,
-  sqliteGetMessageIn,
+  sqliteGetLatestInboundRoute,
   sqliteGetMessageIdBySeq,
+  sqliteGetMessageIn,
   sqliteGetPendingMessages,
   sqliteGetRoutingBySeq,
   sqliteGetSessionRouting,
@@ -166,13 +166,7 @@ export class SqliteAgentMailbox implements AgentMailbox {
   }
 
   getLatestInboundRoute(channelType: string, platformId: string) {
-    const row = getInboundDb()
-      .prepare(
-        `SELECT id, thread_id FROM messages_in
-         WHERE channel_type = ? AND platform_id = ?
-         ORDER BY seq DESC LIMIT 1`,
-      )
-      .get(channelType, platformId) as { id: string; thread_id: string | null } | undefined;
+    const row = sqliteGetLatestInboundRoute(channelType, platformId);
     return row ? { threadId: row.thread_id, inReplyTo: row.id } : null;
   }
 
