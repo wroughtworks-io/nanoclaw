@@ -25,6 +25,7 @@ import {
   createMessagingGroupAgent,
   ensureAgentDestinationForWiring,
   getMessagingGroupAgentByPair,
+  updateMessagingGroup,
 } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { registerChannelCardInterceptor } from '../modules/permissions/channel-approval.js';
@@ -71,6 +72,17 @@ registerChannelCardInterceptor('slack', async (mg) => {
     };
     await createMessagingGroupAgent(mga);
     await ensureAgentDestinationForWiring(mga);
+
+    // TWO GATES, not one. The wiring's sender_scope decides which conversations the agent
+    // engages in; the messaging group's unknown_sender_policy separately decides who may speak
+    // at all. Wiring alone leaves the second gate shut, and the message is dropped as
+    // "unknown sender (decline-and-notify policy)" — wired, and still silent.
+    //
+    // 'public' on a DM means one named human: the person on the other end of it. That is a far
+    // narrower grant than it sounds, and it is the whole point of auto-wiring.
+    if (mg.unknown_sender_policy !== 'public') {
+      await updateMessagingGroup(mg.id, { unknown_sender_policy: 'public' });
+    }
     log.info('Slack DM auto-wired', { messagingGroupId: mg.id, agentGroupId: group.id });
     return 'handled';
   } catch (err) {
