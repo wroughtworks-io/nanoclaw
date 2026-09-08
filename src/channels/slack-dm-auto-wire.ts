@@ -20,6 +20,7 @@
  *     than silently swallowing the escalation
  */
 import { getAgentGroup, getAgentGroupByFolder } from '../db/agent-groups.js';
+import { readEnvFile } from '../env.js';
 import {
   createMessagingGroupAgent,
   ensureAgentDestinationForWiring,
@@ -29,8 +30,13 @@ import { log } from '../log.js';
 import { registerChannelCardInterceptor } from '../modules/permissions/channel-approval.js';
 import { resolveWiringDefaults } from './channel-defaults.js';
 
+// `.env` is NOT loaded into process.env — the codebase parses it into its own object and
+// treats process.env as the FALLBACK (see src/config.ts). Reading process.env alone silently
+// returned undefined here, so this interceptor politely did nothing and every DM still raised
+// a card. Read the file the same way the rest of the codebase does.
 registerChannelCardInterceptor('slack', async (mg) => {
-  const target = process.env.SLACK_DM_AUTO_WIRE?.trim();
+  const env = readEnvFile(['SLACK_DM_AUTO_WIRE']);
+  const target = (process.env.SLACK_DM_AUTO_WIRE || env.SLACK_DM_AUTO_WIRE)?.trim();
   if (!target) return 'card';
   if (mg.is_group) return 'card';
 
