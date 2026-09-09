@@ -1,3 +1,4 @@
+import { THIRD_PARTY_MCP_MUTATION } from './mcp-mutation-policy.js';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -237,6 +238,12 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
 const preToolUseHook: HookCallback = async (input) => {
   const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
   const toolName = i.tool_name ?? '';
+  if (THIRD_PARTY_MCP_MUTATION.test(toolName)) {
+    return {
+      decision: 'block' as const,
+      stopReason: `${toolName} is a write through a third-party MCP server and is denied by default. Read, then propose the change to a human.`,
+    };
+  }
   if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
     return {
       decision: 'block',
