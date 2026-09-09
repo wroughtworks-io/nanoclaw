@@ -13,7 +13,11 @@
  * operator can clear becomes an operator-shaped bottleneck the day the agent is useful.
  *
  * OPT-IN AND NARROW, deliberately:
- *   - does nothing unless SLACK_DM_AUTO_WIRE names an agent group (folder or id)
+ *   - PER INSTANCE. One host runs one Slack app per agent (SLACK_INSTANCES), so a single
+ *     "which agent owns DMs" setting is wrong the moment there are two: a DM to Agent X would
+ *     be wired to whoever that setting happened to name. The target is read per receiving
+ *     instance — SLACK_DM_AUTO_WIRE_<NAME> for `slack-<name>`, SLACK_DM_AUTO_WIRE for the
+ *     unnamed default app.
  *   - direct messages only; group channels still raise a card, because a channel is a room
  *     someone chose to put the agent in and membership there is a real decision
  *   - any failure returns 'card', so a broken interceptor degrades to trunk behaviour rather
@@ -35,9 +39,20 @@ import { resolveWiringDefaults } from './channel-defaults.js';
 // treats process.env as the FALLBACK (see src/config.ts). Reading process.env alone silently
 // returned undefined here, so this interceptor politely did nothing and every DM still raised
 // a card. Read the file the same way the rest of the codebase does.
+/** `slack-klara` → `SLACK_DM_AUTO_WIRE_KLARA`; the default app → `SLACK_DM_AUTO_WIRE`. */
+function autoWireKeyFor(instance: string | undefined): string {
+  if (!instance || instance === 'slack') return 'SLACK_DM_AUTO_WIRE';
+  const suffix = instance.replace(/^slack-/, '').toUpperCase().replace(/-/g, '_');
+  return `SLACK_DM_AUTO_WIRE_${suffix}`;
+}
+
 registerChannelCardInterceptor('slack', async (mg, event) => {
-  const env = readEnvFile(['SLACK_DM_AUTO_WIRE']);
-  const target = (process.env.SLACK_DM_AUTO_WIRE || env.SLACK_DM_AUTO_WIRE)?.trim();
+  // Keyed on the RECEIVING instance, not on a single global setting. The router persists that
+  // instance on the messaging group precisely so sibling bots cannot absorb each other's
+  // traffic; wiring must respect the same boundary.
+  const key = autoWireKeyFor(mg.instance);
+  const env = readEnvFile([key]);
+  const target = (process.env[key] || env[key])?.trim();
   if (!target) return 'card';
   if (mg.is_group) return 'card';
 
