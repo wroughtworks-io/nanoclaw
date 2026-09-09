@@ -35,7 +35,7 @@ import { resolveWiringDefaults } from './channel-defaults.js';
 // treats process.env as the FALLBACK (see src/config.ts). Reading process.env alone silently
 // returned undefined here, so this interceptor politely did nothing and every DM still raised
 // a card. Read the file the same way the rest of the codebase does.
-registerChannelCardInterceptor('slack', async (mg) => {
+registerChannelCardInterceptor('slack', async (mg, event) => {
   const env = readEnvFile(['SLACK_DM_AUTO_WIRE']);
   const target = (process.env.SLACK_DM_AUTO_WIRE || env.SLACK_DM_AUTO_WIRE)?.trim();
   if (!target) return 'card';
@@ -84,6 +84,24 @@ registerChannelCardInterceptor('slack', async (mg) => {
       await updateMessagingGroup(mg.id, { unknown_sender_policy: 'public' });
     }
     log.info('Slack DM auto-wired', { messagingGroupId: mg.id, agentGroupId: group.id });
+
+    // Replay the message that caused the wiring. Without this the FIRST thing anyone ever says
+    // to the agent is silently swallowed — the escalation path drops it and answers only from
+    // the next one — so a new colleague's experience of the agent is being ignored.
+    //
+    // This is the mechanism the router itself documents for the card flow ("replay the event
+    // via routeInbound after approval"), used here for an auto-wire instead of an approval.
+    //
+    // It cannot loop: the wiring above is committed before this runs, so the replay finds
+    // agentCount > 0 and never reaches the escalation branch again. Imported lazily because
+    // the router imports the channel barrel, and a static import would close that cycle.
+    try {
+      const { routeInbound } = await import('../router.js');
+      await routeInbound(event);
+    } catch (err) {
+      // The wiring stands regardless; only this message is lost, and the next one works.
+      log.warn('Slack DM auto-wire: replay of the triggering message failed', { messagingGroupId: mg.id, err });
+    }
     return 'handled';
   } catch (err) {
     log.error('Slack DM auto-wire failed — falling back to the approval card', { err });
