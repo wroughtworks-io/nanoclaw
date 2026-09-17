@@ -80,9 +80,22 @@ export const AGENT_ACCESS_SCOPE_WARNING =
 // or deliberately ignored it); 'card' = proceed with today's card flow.
 // Interceptor errors fall back to the card — a broken module must never make
 // escalations silently vanish.
+//
+// `senderUserId` is the namespaced id of whoever triggered the escalation
+// (e.g. "slack:U0ABC"), resolved by the caller, or null when the payload
+// carries no usable handle. It is passed in rather than re-derived here
+// because the extraction is subtle — chat-sdk nests `author.userId` while
+// older adapters use top-level `senderId`/`sender` — and a second copy of
+// that parser is a second place for it to rot. Interceptors that gate on WHO
+// mentioned the bot (an admin-only auto-wire, say) need it; ones that don't
+// simply ignore the argument.
 
 export type ChannelCardDecision = 'card' | 'handled';
-export type ChannelCardInterceptor = (mg: MessagingGroup, event: InboundEvent) => Promise<ChannelCardDecision>;
+export type ChannelCardInterceptor = (
+  mg: MessagingGroup,
+  event: InboundEvent,
+  senderUserId: string | null,
+) => Promise<ChannelCardDecision>;
 
 const channelCardInterceptors = new Map<string, ChannelCardInterceptor>();
 
@@ -194,10 +207,14 @@ function describeResolvedRule(
 export interface RequestChannelApprovalInput {
   messagingGroupId: string;
   event: InboundEvent;
+  /** Namespaced id of the sender who triggered the escalation, when the
+   *  caller could resolve one. Forwarded to the channel-card interceptor;
+   *  the card flow itself does not use it. */
+  senderUserId?: string | null;
 }
 
 export async function requestChannelApproval(input: RequestChannelApprovalInput): Promise<void> {
-  const { messagingGroupId, event } = input;
+  const { messagingGroupId, event, senderUserId = null } = input;
 
   if (await hasInFlightChannelApproval(messagingGroupId)) {
     log.debug('Channel registration already in flight — dropping retry', { messagingGroupId });
@@ -213,7 +230,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   const interceptor = originMg ? channelCardInterceptors.get(originMg.channel_type) : undefined;
   if (originMg && interceptor) {
     try {
-      if ((await interceptor(originMg, event)) === 'handled') {
+      if ((await interceptor(originMg, event, senderUserId)) === 'handled') {
         log.debug('Channel registration handled by interceptor — no card', {
           messagingGroupId,
           channelType: originMg.channel_type,

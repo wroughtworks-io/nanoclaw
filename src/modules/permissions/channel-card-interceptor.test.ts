@@ -9,6 +9,8 @@
  *  - interceptor throw → card fallback (a broken module never makes
  *    escalations vanish)
  *  - in-flight dedupe still short-circuits before the interceptor
+ *  - the resolved sender id is forwarded as the third argument (null when
+ *    the caller could not identify the sender)
  */
 import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
@@ -147,9 +149,23 @@ describe('channel-card interceptor seam', () => {
     await requestChannelApproval({ messagingGroupId: mg.id, event });
 
     expect(interceptor).toHaveBeenCalledTimes(1);
-    expect(interceptor).toHaveBeenCalledWith(expect.objectContaining({ id: mg.id }), event);
+    // Third argument is the resolved sender id: null here because this test calls
+    // requestChannelApproval directly, the way a caller that cannot identify the sender does.
+    expect(interceptor).toHaveBeenCalledWith(expect.objectContaining({ id: mg.id }), event, null);
     expect(deliverMock).not.toHaveBeenCalled();
     expect(await pendingCount()).toBe(0);
+  });
+
+  it('forwards the resolved sender id to the interceptor', async () => {
+    const { registerChannelCardInterceptor, requestChannelApproval } = await import('./channel-approval.js');
+    const interceptor = vi.fn().mockResolvedValue('handled');
+    registerChannelCardInterceptor('telegram', interceptor);
+
+    const mg = await unwiredChannel('mg-sender');
+    const event = mention(mg);
+    await requestChannelApproval({ messagingGroupId: mg.id, event, senderUserId: 'telegram:owner' });
+
+    expect(interceptor).toHaveBeenCalledWith(expect.objectContaining({ id: mg.id }), event, 'telegram:owner');
   });
 
   it("'card' proceeds with today's flow", async () => {

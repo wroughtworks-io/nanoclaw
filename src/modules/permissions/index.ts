@@ -336,7 +336,21 @@ registerResponseHandler(handleSenderApprovalResponse);
 // ── Unknown-channel registration flow ──
 
 setChannelRequestGate(async (mg, event) => {
-  await requestChannelApproval({ messagingGroupId: mg.id, event });
+  // Resolve the sender HERE, where the parser already lives, and hand the id
+  // to requestChannelApproval for its interceptor. The router's own
+  // resolution (setSenderResolver) happens further down routeInbound, past
+  // the unwired branch that calls this gate, so at this point nobody has
+  // identified the sender yet. A null id is normal (payloads without a usable
+  // handle) and interceptors must tolerate it.
+  let senderUserId: string | null = null;
+  try {
+    senderUserId = await extractAndUpsertUser(event);
+  } catch (err) {
+    // Never block an escalation on identification: the card flow does not
+    // need the id, and an interceptor that does will decline to act on null.
+    log.warn('Channel escalation: could not resolve the triggering sender', { messagingGroupId: mg.id, err });
+  }
+  await requestChannelApproval({ messagingGroupId: mg.id, event, senderUserId });
 });
 
 /**

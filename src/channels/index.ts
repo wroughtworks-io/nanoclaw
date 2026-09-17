@@ -9,4 +9,4 @@
 import './cli.js';
 import './slack.js';
 import './slack-a2a-guard.js';
-import './slack-dm-auto-wire.js';
+import './slack-auto-wire.js';
