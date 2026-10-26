@@ -38,6 +38,7 @@ import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './dr
 import { getGatewayProvider, type GatewayContribution } from './gateway-providers/index.js';
 import { initGroupFilesystem } from './group-init.js';
 import { getAgentMailbox } from './mailbox/index.js';
+import { prepareBrokerEnv, type BrokerEnv } from './notion-broker.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
@@ -211,6 +212,10 @@ async function spawnContainer(session: Session): Promise<void> {
     );
   }
 
+  // Per-requester Notion broker credential: minted here (async, writes the
+  // hash to the session row) and handed to the pure composer as data.
+  const brokerEnv = await prepareBrokerEnv(session, containerConfig);
+
   const spec = composeSessionSpec({
     agentGroup,
     session,
@@ -220,6 +225,7 @@ async function spawnContainer(session: Session): Promise<void> {
     contribution,
     gateway,
     mailboxEnvironment,
+    brokerEnv,
   });
 
   log.info('Spawning session', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -646,6 +652,11 @@ export interface ComposeSessionSpecInput {
   gateway: GatewayContribution;
   /** Non-secret configuration supplied by the selected mailbox implementation. */
   mailboxEnvironment: Record<string, string>;
+  /**
+   * Per-session Notion broker env (secret + URL), already minted and persisted
+   * by the caller. Ridden on the contributed lane — see composeSessionSpec.
+   */
+  brokerEnv?: BrokerEnv;
 }
 
 /**
@@ -666,8 +677,17 @@ export function mergeMounts(composed: MountSpec[], contributed: MountSpec[]): Mo
  * says how it is realized.
  */
 export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec {
-  const { agentGroup, session, containerName, mounts, containerConfig, contribution, gateway, mailboxEnvironment } =
-    input;
+  const {
+    agentGroup,
+    session,
+    containerName,
+    mounts,
+    containerConfig,
+    contribution,
+    gateway,
+    mailboxEnvironment,
+    brokerEnv,
+  } = input;
 
   const env: Record<string, string> = {
     TZ: containerConfig.timezone ?? TIMEZONE,
@@ -681,6 +701,17 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
   const contributedEnv: Record<string, string> = {
     ...(contribution.env ?? {}),
     ...(gateway.env ?? {}),
+    // Last, so no provider/gateway contribution can substitute another
+    // session's broker secret or URL.
+    //
+    // Lane choice: the plain `env` lane runs `isSecretShaped`, which refuses
+    // any key ending in _TOKEN — and NANOCLAW_BROKER_TOKEN must. The contributed
+    // lane is the sanctioned channel for credential-NAMED configuration and
+    // still refuses credential VALUES (`looksLikeCredential`), which
+    // mintBrokerSecret() guarantees by re-drawing. Nothing is exempted or
+    // relaxed; the secret is a session-scoped, host-revocable handle, not a
+    // Notion credential (the broker holds those).
+    ...(brokerEnv ?? {}),
   };
 
   const hostUid = process.getuid?.();

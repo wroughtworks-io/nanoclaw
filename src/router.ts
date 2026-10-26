@@ -31,7 +31,13 @@ import { findSessionForAgent } from './db/sessions.js';
 import { backfillNewSession, fanInboundMessage } from './modules/cross-session-context/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import {
+  dmRequesterFor,
+  ensureSessionRequester,
+  resolveSession,
+  writeSessionMessage,
+  writeOutboundDirect,
+} from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
@@ -535,12 +541,17 @@ async function deliverToAgent(
     effectiveSessionMode = 'per-thread';
   }
 
+  const requesterUserId = dmRequesterFor(mg, effectiveSessionMode, userId);
   const { session, created } = await resolveSession(
     agent.agent_group_id,
     mg.id,
     effectiveThreadId,
     effectiveSessionMode,
+    requesterUserId,
   );
+  // An existing DM session that predates the column gets its requester on its
+  // next inbound; a non-null value is never overwritten.
+  await ensureSessionRequester(session, requesterUserId);
 
   // The inbound row's (channel_type, platform_id, thread_id) is the address
   // the agent's reply will be delivered to. Normally it mirrors the source

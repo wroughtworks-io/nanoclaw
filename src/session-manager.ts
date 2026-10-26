@@ -19,6 +19,7 @@ import {
   findSessionByAgentGroup,
   findSessionForAgent,
   getSession,
+  setSessionRequesterIfUnset,
   taskThreadId,
   updateSession,
 } from './db/sessions.js';
@@ -105,6 +106,7 @@ export async function resolveSession(
   messagingGroupId: string | null,
   threadId: string | null,
   sessionMode: 'shared' | 'per-thread' | 'agent-shared',
+  requesterUserId: string | null = null,
 ): Promise<{ session: Session; created: boolean }> {
   const key = sessionCreationKey(agentGroupId, messagingGroupId, threadId, sessionMode);
   return withSessionCreationLock(key, async () => {
@@ -136,6 +138,7 @@ export async function resolveSession(
       container_status: 'stopped',
       last_active: null,
       created_at: new Date().toISOString(),
+      requester_user_id: requesterUserId,
     };
 
     try {
@@ -156,6 +159,50 @@ export async function resolveSession(
 
     return { session, created: true };
   });
+}
+
+/**
+ * Whose Notion identity a session may act as: the routed sender, but ONLY in a
+ * DM (messaging group `is_group = 0` — never inferred from threadId; DM
+ * sub-threads exist) and never in an `agent-shared` session, which spans
+ * messaging groups and so people. Anything else is null.
+ */
+export function dmRequesterFor(
+  mg: { is_group: number },
+  sessionMode: 'shared' | 'per-thread' | 'agent-shared',
+  userId: string | null,
+): string | null {
+  if (mg.is_group !== 0 || sessionMode === 'agent-shared') return null;
+  return userId || null;
+}
+
+/**
+ * Backfill an existing DM session whose requester is NULL. Never overwrites:
+ * the UPDATE is conditional on NULL, and a different non-null user is logged
+ * and left alone. Mutates `session` to reflect what is now stored.
+ */
+export async function ensureSessionRequester(session: Session, requesterUserId: string | null): Promise<void> {
+  if (!requesterUserId) return;
+  if (session.requester_user_id) {
+    if (session.requester_user_id !== requesterUserId) {
+      log.warn('DM session requester differs from inbound sender; leaving stored requester unchanged', {
+        sessionId: session.id,
+      });
+    }
+    return;
+  }
+  if (await setSessionRequesterIfUnset(session.id, requesterUserId)) {
+    session.requester_user_id = requesterUserId;
+    return;
+  }
+  // Lost a race (or the in-memory row was stale): re-read, then apply the same rule.
+  const fresh = await getSession(session.id);
+  session.requester_user_id = fresh?.requester_user_id ?? null;
+  if (session.requester_user_id && session.requester_user_id !== requesterUserId) {
+    log.warn('DM session requester differs from inbound sender; leaving stored requester unchanged', {
+      sessionId: session.id,
+    });
+  }
 }
 
 /** Find or create the per-agent-group session used for scheduled tasks. */

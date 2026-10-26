@@ -35,6 +35,7 @@ import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
+import { addNotionBrokerServer, NOTION_BROKER_SERVER_NAME } from './notion-broker-mcp.js';
 import { resolvePluginServer } from './plugin-mcp.js';
 import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
@@ -108,10 +109,16 @@ async function main(): Promise<void> {
     );
   }
 
+  // Per-requester Notion server (host-minted session secret; see notion-broker-mcp.ts).
+  const providerEnv: Record<string, string | undefined> = { ...process.env };
+  if (addNotionBrokerServer(mcpServers, providerEnv)) {
+    log(`Additional MCP server: ${NOTION_BROKER_SERVER_NAME} (HTTP, broker)`);
+  }
+
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
     mcpServers,
-    env: { ...process.env },
+    env: providerEnv,
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
     model: config.model,
     effort: config.effort,

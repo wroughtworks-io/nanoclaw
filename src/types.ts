@@ -33,6 +33,8 @@ export interface ContainerConfigRow {
    * and `SELECT *` rows surface it here. Absent means the default tier.
    */
   runtime_tier?: string | null;
+  /** 1 = agent opts in to the per-requester Notion broker MCP server (migration 024). */
+  notion_broker?: number;
   updated_at: string;
 }
 
@@ -161,6 +163,10 @@ export interface Session {
   container_status: 'running' | 'idle' | 'stopped';
   last_active: string | null;
   created_at: string;
+  /** NanoClaw user id of the person in a DM session (is_group=0); host-set, NULL otherwise. */
+  requester_user_id?: string | null;
+  /** Lowercase hex sha256 of the per-container-start Notion broker secret. */
+  broker_token_hash?: string | null;
 }
 
 // ── Session DB entities ──

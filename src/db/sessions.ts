@@ -7,10 +7,29 @@ export const TASKS_SYSTEM_THREAD_ID = 'system:tasks';
 
 export async function createSession(session: Session): Promise<void> {
   await getDb().run(
-    `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
-       VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at)`,
-    session,
+    `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at, requester_user_id)
+       VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at, @requester_user_id)`,
+    { ...session, requester_user_id: session.requester_user_id ?? null },
   );
+}
+
+/**
+ * Set a session's requester only if it has none. Atomic (`IS NULL` in the
+ * WHERE), so a concurrent writer can never be overwritten. Returns whether
+ * the row changed.
+ */
+export async function setSessionRequesterIfUnset(sessionId: string, userId: string): Promise<boolean> {
+  const res = await getDb().run(
+    'UPDATE sessions SET requester_user_id = ? WHERE id = ? AND requester_user_id IS NULL',
+    userId,
+    sessionId,
+  );
+  return res.changes > 0;
+}
+
+/** Store the hash of this container start's broker secret (overwrites the previous one). */
+export async function setSessionBrokerTokenHash(sessionId: string, hash: string): Promise<void> {
+  await getDb().run('UPDATE sessions SET broker_token_hash = ? WHERE id = ?', hash, sessionId);
 }
 
 export async function getSession(id: string): Promise<Session | undefined> {
