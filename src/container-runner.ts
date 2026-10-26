@@ -36,7 +36,8 @@ import type { SupervisedHandle, SupervisedSnapshot } from './drivers/session-eve
 import { GROUP_FOLDER_LABEL, labelValueLegal, specInvalid } from './drivers/types.js';
 import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './drivers/types.js';
 import { getGatewayProvider, type GatewayContribution } from './gateway-providers/index.js';
-import { initGroupFilesystem } from './group-init.js';
+import { initGroupFilesystem, seedMemoryScaffold } from './group-init.js';
+import { SESSION_CONVERSATIONS_DIR, sessionClaudeStateDir } from './session-claude-state.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { prepareBrokerEnv, revokeBrokerSecretOnStop, sha256Hex, type BrokerEnv } from './notion-broker.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
@@ -472,6 +473,47 @@ async function resolveProviderContribution(
   return { provider, contribution };
 }
 
+/**
+ * Mounts for a session's private Claude state. Pure of the central DB; creates
+ * host directories/placeholders so Docker never creates root-owned mountpoints.
+ */
+export function buildClaudeStateMounts(
+  agentGroupId: string,
+  sessionId: string,
+  sharedClaudeDir: string,
+  scope: string,
+): VolumeMount[] {
+  const stateDir = sessionClaudeStateDir(agentGroupId, sessionId);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const out: VolumeMount[] = [
+    { hostPath: stateDir, containerPath: '/home/node/.claude', readonly: false, mountClass: 'group-state', scope },
+  ];
+  const sharedSettings = path.join(sharedClaudeDir, 'settings.json');
+  if (fs.existsSync(sharedSettings)) {
+    const placeholder = path.join(stateDir, 'settings.json');
+    if (!fs.existsSync(placeholder)) fs.writeFileSync(placeholder, '');
+    out.push({
+      hostPath: sharedSettings,
+      containerPath: '/home/node/.claude/settings.json',
+      readonly: true,
+      mountClass: 'group-state',
+      scope,
+    });
+  }
+  const sharedSkills = path.join(sharedClaudeDir, 'skills');
+  if (fs.existsSync(sharedSkills)) {
+    fs.mkdirSync(path.join(stateDir, 'skills'), { recursive: true });
+    out.push({
+      hostPath: sharedSkills,
+      containerPath: '/home/node/.claude/skills',
+      readonly: true,
+      mountClass: 'group-state',
+      scope,
+    });
+  }
+  return out;
+}
+
 export async function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
@@ -586,17 +628,28 @@ export async function buildMounts(
     });
   }
 
-  // Per-group .claude-shared at /home/node/.claude (provider state, settings,
-  // skill symlinks). Per agent group, not per session.
+  // Per-SESSION Claude state at /home/node/.claude (SDK transcripts, runtime
+  // state, conversation archives). Lives in a sibling of the session dir, NOT
+  // inside it, so it is never reachable through the session's own /workspace
+  // mount. The group's settings.json and skills/ stay the group's, laid over
+  // it read-only — host-side writers of .claude-shared are unchanged. This is
+  // what stops one requester's session from reading another's transcript.
   if (defaultSurfaces) {
-    mounts.push({
-      hostPath: claudeDir,
-      containerPath: '/home/node/.claude',
-      readonly: false,
-      mountClass: 'group-state',
-      scope,
-    });
+    mounts.push(...buildClaudeStateMounts(agentGroup.id, session.id, claudeDir, scope));
   }
+
+  // Shared notes (memory/) are read-only in containers: they were a
+  // cross-session leak and have no write gate yet. Seeded host-side right here, before the mount.
+  // Nested RO mount over the RW group dir, same pattern as container.json.
+  const memoryDir = path.join(groupDir, 'memory');
+  seedMemoryScaffold(groupDir);
+  mounts.push({
+    hostPath: memoryDir,
+    containerPath: '/workspace/agent/memory',
+    readonly: true,
+    mountClass: 'group-state',
+    scope,
+  });
 
   // Shared agent-runner source — read-only, same code for all groups.
   const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
@@ -725,6 +778,13 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     // Notion credential (the broker holds those).
     ...(brokerEnv ?? {}),
   };
+
+  // Archives go into the session's own Claude state (never the shared group
+  // folder). Set after the mailbox env so nothing can redirect it, and only
+  // when the per-session state is actually mounted there.
+  if (mounts.some((m) => m.containerPath === '/home/node/.claude' && !m.readonly)) {
+    env.NANOCLAW_CONVERSATIONS_DIR = SESSION_CONVERSATIONS_DIR;
+  }
 
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();

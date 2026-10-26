@@ -24,11 +24,31 @@ export function ensureMemoryScaffold(baseDir = '/workspace/agent'): void {
   const memoryDir = path.join(baseDir, 'memory');
   const systemDir = path.join(memoryDir, 'system');
 
-  fs.mkdirSync(systemDir, { recursive: true });
+  try {
+    fs.mkdirSync(systemDir, { recursive: true });
 
-  copyTemplateIfMissing('index.md', path.join(memoryDir, 'index.md'));
-  copyTemplateIfMissing(path.join('system', 'index.md'), path.join(systemDir, 'index.md'));
-  copyTemplateIfMissing(path.join('system', 'definition.md'), path.join(systemDir, 'definition.md'));
+    copyTemplateIfMissing('index.md', path.join(memoryDir, 'index.md'));
+    copyTemplateIfMissing(path.join('system', 'index.md'), path.join(systemDir, 'index.md'));
+    copyTemplateIfMissing(path.join('system', 'definition.md'), path.join(systemDir, 'definition.md'));
+  } catch (err) {
+    // memory/ is mounted read-only in containers (the host seeds it before the
+    // mount). A read-only tree is expected, not an error: skip, say so once.
+    if (isReadOnlyError(err)) {
+      if (!loggedReadOnly) {
+        loggedReadOnly = true;
+        console.error('[agent-runner] memory/ is read-only; skipping scaffold writes (host seeds it)');
+      }
+      return;
+    }
+    throw err;
+  }
+}
+
+let loggedReadOnly = false;
+
+function isReadOnlyError(err: unknown): boolean {
+  const code = typeof err === 'object' && err !== null && 'code' in err ? (err as { code: unknown }).code : undefined;
+  return code === 'EROFS' || code === 'EACCES' || code === 'EPERM';
 }
 
 function copyTemplateIfMissing(template: string, dest: string): void {

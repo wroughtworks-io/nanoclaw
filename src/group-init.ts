@@ -127,3 +127,22 @@ export async function initGroupFilesystem(
     });
   }
 }
+
+const MEMORY_TEMPLATES_DIR = path.join(process.cwd(), 'container', 'agent-runner', 'src', 'memory', 'templates');
+const MEMORY_SCAFFOLD_FILES = ['index.md', path.join('system', 'index.md'), path.join('system', 'definition.md')];
+
+/** Host-side twin of the runner's ensureMemoryScaffold, called at mount time (not from
+ * initGroupFilesystem, which must not create memory/). Returns true if it wrote anything. */
+export function seedMemoryScaffold(groupDir: string, templatesDir = MEMORY_TEMPLATES_DIR): boolean {
+  const memoryDir = path.join(groupDir, 'memory');
+  fs.mkdirSync(path.join(memoryDir, 'system'), { recursive: true });
+  let wrote = false;
+  for (const rel of MEMORY_SCAFFOLD_FILES) {
+    const src = path.join(templatesDir, rel);
+    const dst = path.join(memoryDir, rel);
+    if (!fs.existsSync(src) || fs.existsSync(dst)) continue;
+    fs.copyFileSync(src, dst, fs.constants.COPYFILE_EXCL);
+    wrote = true;
+  }
+  return wrote;
+}
