@@ -52,9 +52,11 @@ describe('per-session mounts', () => {
     expect(claude(a).hostPath).not.toBe(shared);
     const ws = a.find((m) => m.containerPath === '/workspace')!;
     expect(claude(a).hostPath.startsWith(ws.hostPath + path.sep)).toBe(false);
-    const settings = a.find((m) => m.containerPath === '/home/node/.claude/settings.json')!;
+    // settings.json is copied fresh into the session's own state (the runner rewrites it at start),
+    // never overlaid read-only.
+    expect(a.find((m) => m.containerPath === '/home/node/.claude/settings.json')).toBeUndefined();
+    expect(fs.readFileSync(path.join(claude(a).hostPath, 'settings.json'), 'utf8')).toBe('{}');
     const skills = a.find((m) => m.containerPath === '/home/node/.claude/skills')!;
-    expect(settings).toMatchObject({ hostPath: path.join(shared, 'settings.json'), readonly: true });
     expect(skills).toMatchObject({ hostPath: path.join(shared, 'skills'), readonly: true });
     expect(a.map((m) => m.hostPath)).not.toContain(shared);
   });

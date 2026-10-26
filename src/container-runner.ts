@@ -488,17 +488,16 @@ export function buildClaudeStateMounts(
   const out: VolumeMount[] = [
     { hostPath: stateDir, containerPath: '/home/node/.claude', readonly: false, mountClass: 'group-state', scope },
   ];
+  // settings.json is COPIED fresh at every spawn, not overlaid read-only: the runner rewrites it
+  // at start (writeMemorySessionHook, agent-runner providers/claude.ts) and a read-only overlay
+  // crashed every container with EROFS. Settings carry nothing personal; the shared copy stays
+  // the host-side source, so group-init / migrate-claude-memory-settings changes still apply.
   const sharedSettings = path.join(sharedClaudeDir, 'settings.json');
   if (fs.existsSync(sharedSettings)) {
-    const placeholder = path.join(stateDir, 'settings.json');
-    if (!fs.existsSync(placeholder)) fs.writeFileSync(placeholder, '');
-    out.push({
-      hostPath: sharedSettings,
-      containerPath: '/home/node/.claude/settings.json',
-      readonly: true,
-      mountClass: 'group-state',
-      scope,
-    });
+    const dest = path.join(stateDir, 'settings.json');
+    const tmp = `${dest}.tmp-${process.pid}`;
+    fs.copyFileSync(sharedSettings, tmp);
+    fs.renameSync(tmp, dest);
   }
   const sharedSkills = path.join(sharedClaudeDir, 'skills');
   if (fs.existsSync(sharedSkills)) {
