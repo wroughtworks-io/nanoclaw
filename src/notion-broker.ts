@@ -11,7 +11,7 @@
 import crypto from 'crypto';
 
 import { readEnvFile } from './env.js';
-import { setSessionBrokerTokenHash } from './db/sessions.js';
+import { clearSessionBrokerTokenHashIf, setSessionBrokerTokenHash } from './db/sessions.js';
 import { looksLikeCredential } from './drivers/types.js';
 import { log } from './log.js';
 import type { ContainerConfig } from './container-config.js';
@@ -47,7 +47,7 @@ export function configuredBrokerUrl(): string | undefined {
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('not http(s)');
-  // eslint-disable-next-line no-catch-all/no-catch-all -- an unparseable URL is a config error: disable, don't crash spawn
+    // eslint-disable-next-line no-catch-all/no-catch-all -- an unparseable URL is a config error: disable, don't crash spawn
   } catch {
     log.warn('NOTION_BROKER_URL is not a valid http(s) URL; personal Notion server disabled');
     return undefined;
@@ -71,4 +71,19 @@ export async function prepareBrokerEnv(
   const secret = mintBrokerSecret();
   await setSessionBrokerTokenHash(session.id, sha256Hex(secret));
   return { NANOCLAW_BROKER_TOKEN: secret, NANOCLAW_NOTION_BROKER_URL: brokerUrl };
+}
+
+/**
+ * A container stopped: kill its secret now rather than at the next start.
+ * Conditional on the stored hash still being this container's, so a quick
+ * restart's fresh hash is never wiped. No-op for containers started without a
+ * broker secret. Never throws (stop bookkeeping must not break teardown).
+ */
+export async function revokeBrokerSecretOnStop(sessionId: string, hash: string | undefined): Promise<void> {
+  if (!hash) return;
+  try {
+    await clearSessionBrokerTokenHashIf(sessionId, hash);
+  } catch (err) {
+    log.error('Failed to clear broker token hash on container stop', { sessionId, err });
+  }
 }

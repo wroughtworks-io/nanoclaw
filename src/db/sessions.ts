@@ -32,6 +32,19 @@ export async function setSessionBrokerTokenHash(sessionId: string, hash: string)
   await getDb().run('UPDATE sessions SET broker_token_hash = ? WHERE id = ?', hash, sessionId);
 }
 
+/**
+ * Null the broker hash only if it still equals `hash` (the secret of the
+ * container that just stopped). A newer container's hash is never wiped.
+ */
+export async function clearSessionBrokerTokenHashIf(sessionId: string, hash: string): Promise<boolean> {
+  const res = await getDb().run(
+    'UPDATE sessions SET broker_token_hash = NULL WHERE id = ? AND broker_token_hash = ?',
+    sessionId,
+    hash,
+  );
+  return res.changes > 0;
+}
+
 export async function getSession(id: string): Promise<Session | undefined> {
   return getDb().get<Session>('SELECT * FROM sessions WHERE id = ?', id);
 }

@@ -12,7 +12,7 @@ import { composeSessionSpec } from './container-runner.js';
 import { closeDb, createAgentGroup, createSession, getSession, initSqliteTestDb, runMigrations } from './db/index.js';
 import { fixtureSpec, FIXTURE_POLICY } from './drivers/spec-fixture.js';
 import { looksLikeCredential, validateSpec } from './drivers/types.js';
-import { mintBrokerSecret, prepareBrokerEnv, sha256Hex } from './notion-broker.js';
+import { mintBrokerSecret, prepareBrokerEnv, revokeBrokerSecretOnStop, sha256Hex } from './notion-broker.js';
 import type { AgentGroup, Session } from './types.js';
 
 vi.mock('./log.js', () => ({
@@ -184,5 +184,29 @@ describe('configFromDb notionBroker', () => {
     expect(configFromDb(row(1), group).notionBroker).toBe(true);
     expect(configFromDb(row(0), group).notionBroker).toBeUndefined();
     expect(configFromDb(row(), group).notionBroker).toBeUndefined();
+  });
+});
+
+describe('revokeBrokerSecretOnStop', () => {
+  it('clears the hash when it still matches the stopped container', async () => {
+    const session = await seedSession('slack:U1');
+    const env = (await prepareBrokerEnv(session, config(true), URL_))!;
+    await revokeBrokerSecretOnStop('s-1', sha256Hex(env.NANOCLAW_BROKER_TOKEN));
+    expect((await getSession('s-1'))!.broker_token_hash).toBeNull();
+  });
+
+  it("does not wipe a newer container's hash", async () => {
+    const session = await seedSession('slack:U1');
+    const first = (await prepareBrokerEnv(session, config(true), URL_))!;
+    const second = (await prepareBrokerEnv(session, config(true), URL_))!;
+    await revokeBrokerSecretOnStop('s-1', sha256Hex(first.NANOCLAW_BROKER_TOKEN));
+    expect((await getSession('s-1'))!.broker_token_hash).toBe(sha256Hex(second.NANOCLAW_BROKER_TOKEN));
+  });
+
+  it('is a no-op for a container started without a broker secret', async () => {
+    const session = await seedSession('slack:U1');
+    const env = (await prepareBrokerEnv(session, config(true), URL_))!;
+    await revokeBrokerSecretOnStop('s-1', undefined);
+    expect((await getSession('s-1'))!.broker_token_hash).toBe(sha256Hex(env.NANOCLAW_BROKER_TOKEN));
   });
 });

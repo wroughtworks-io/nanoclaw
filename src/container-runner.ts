@@ -38,7 +38,7 @@ import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './dr
 import { getGatewayProvider, type GatewayContribution } from './gateway-providers/index.js';
 import { initGroupFilesystem } from './group-init.js';
 import { getAgentMailbox } from './mailbox/index.js';
-import { prepareBrokerEnv, type BrokerEnv } from './notion-broker.js';
+import { prepareBrokerEnv, revokeBrokerSecretOnStop, sha256Hex, type BrokerEnv } from './notion-broker.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
@@ -98,6 +98,8 @@ interface ActiveSessionRuntime {
   finishedPromise: Promise<void>;
   resolveFinished: () => void;
   stopReason?: string;
+  /** sha256 of the broker secret this container was started with, if any. */
+  brokerTokenHash?: string;
 }
 
 const activeContainers = new Map<string, ActiveSessionRuntime>();
@@ -238,7 +240,13 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const handle = await driver.prepare(spec);
 
-  const runtime = registerRuntime(session.id, handle, containerName, false);
+  const runtime = registerRuntime(
+    session.id,
+    handle,
+    containerName,
+    false,
+    brokerEnv ? sha256Hex(brokerEnv.NANOCLAW_BROKER_TOKEN) : undefined,
+  );
 
   try {
     await armSessionLifecycle({
@@ -254,6 +262,7 @@ async function spawnContainer(session: Session): Promise<void> {
     if (activeContainers.get(session.id) === runtime && !runtime.finished) {
       activeContainers.delete(session.id);
       runtime.resolveFinished();
+      await revokeBrokerSecretOnStop(session.id, runtime.brokerTokenHash);
     } else {
       await runtime.finishedPromise;
     }
@@ -285,6 +294,7 @@ function registerRuntime(
   handle: SupervisedHandle,
   containerName: string,
   adopted: boolean,
+  brokerTokenHash?: string,
 ): ActiveSessionRuntime {
   let resolveFinished!: () => void;
   const finishedPromise = new Promise<void>((resolve) => {
@@ -295,6 +305,7 @@ function registerRuntime(
     containerName,
     startedAtMs: Date.now(),
     adopted,
+    brokerTokenHash,
     exitCallbacks: [],
     finished: false,
     finishedPromise,
@@ -323,6 +334,7 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
   } catch (err) {
     log.error('Failed to record stopped container', { sessionId, containerName, err });
   }
+  await revokeBrokerSecretOnStop(sessionId, runtime.brokerTokenHash);
   try {
     stopTypingRefresh(sessionId);
   } catch (err) {
@@ -408,7 +420,7 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
       stopped += 1;
       continue;
     }
-    const runtime = registerRuntime(session.id, handle, handle.name, true);
+    const runtime = registerRuntime(session.id, handle, handle.name, true, session.broker_token_hash ?? undefined);
     runtime.stopReason = undefined;
     handle.onTerminal((failure) => {
       void finishAndResolve(session.id, failure);
