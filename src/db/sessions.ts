@@ -14,6 +14,18 @@ export async function createSession(session: Session): Promise<void> {
 }
 
 /**
+ * Stamp the session as engaged (the agent was actually addressed: a waking
+ * message was delivered). Idempotent — first stamp wins.
+ */
+export async function markSessionEngaged(sessionId: string): Promise<void> {
+  await getDb().run(
+    'UPDATE sessions SET engaged_at = ? WHERE id = ? AND engaged_at IS NULL',
+    new Date().toISOString(),
+    sessionId,
+  );
+}
+
+/**
  * Set a session's requester only if it has none. Atomic (`IS NULL` in the
  * WHERE), so a concurrent writer can never be overwritten. Returns whether
  * the row changed.

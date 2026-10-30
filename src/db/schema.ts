@@ -120,7 +120,8 @@ CREATE TABLE sessions (
   last_active        TEXT,
   created_at         TEXT NOT NULL,
   requester_user_id  TEXT,             -- DM person, host-set (migration 024)
-  broker_token_hash  TEXT              -- sha256 hex of per-session broker secret (migration 024)
+  broker_token_hash  TEXT,             -- sha256 hex of per-session broker secret (migration 024)
+  engaged_at         TEXT              -- first waking (trigger=1) message; gates mention-sticky (migration 025)
 );
 CREATE INDEX idx_sessions_agent_group ON sessions(agent_group_id);
 CREATE INDEX idx_sessions_lookup ON sessions(messaging_group_id, thread_id);

@@ -9,7 +9,16 @@
  *
  * After delivering a user-facing message, the refresh is paused for
  * POST_DELIVERY_PAUSE_MS so the client-side indicator can visually
- * clear.
+ * clear. Once a reply has gone out the container is demonstrably awake,
+ * so the startup grace no longer applies: typing resumes only while the
+ * heartbeat is fresh (agent still working).
+ *
+ * Every way a refresher ends (idle timeout, container exit, failed wake)
+ * also CLEARS the platform indicator (setTyping with status ''). Some
+ * platforms (Slack assistant status) never expire it on their own and only
+ * auto-clear when a message is posted — so a last refresh landing after the
+ * final reply, or a turn that ends with no output, would otherwise show
+ * "Typing…" indefinitely.
  *
  * Default module status:
  *   - Lives in src/modules/ for signaling (not really core), but ships
@@ -45,7 +54,14 @@ const HEARTBEAT_FRESH_MS = 6000;
 const POST_DELIVERY_PAUSE_MS = 10000;
 
 interface TypingAdapter {
-  setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
+  setTyping?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    instance?: string,
+    /** '' = clear the indicator (adapters without a clear primitive no-op). */
+    status?: string,
+  ): Promise<void>;
 }
 
 interface TypingTarget {
@@ -58,6 +74,8 @@ interface TypingTarget {
   interval: NodeJS.Timeout;
   startedAt: number;
   pausedUntil: number; // epoch ms; 0 = not paused
+  /** A user-facing message was delivered since the last inbound; grace no longer applies. */
+  delivered: boolean;
 }
 
 let adapter: TypingAdapter | null = null;
@@ -84,6 +102,20 @@ async function triggerTyping(
     await adapter?.setTyping?.(channelType, platformId, threadId, instance);
   } catch {
     // Typing is best-effort — don't let it fail delivery or routing.
+  }
+}
+
+/** Best-effort clear of the platform indicator. */
+async function clearTyping(
+  channelType: string,
+  platformId: string,
+  threadId: string | null,
+  instance?: string,
+): Promise<void> {
+  try {
+    await adapter?.setTyping?.(channelType, platformId, threadId, instance, '');
+  } catch {
+    // Best-effort — never fail routing/teardown over an indicator.
   }
 }
 
@@ -115,6 +147,7 @@ export function startTypingRefresh(
     triggerTyping(channelType, platformId, threadId, instance).catch(() => {});
     existing.startedAt = Date.now();
     existing.pausedUntil = 0;
+    existing.delivered = false;
     // Keep the stored entry self-consistent: a re-trigger can arrive from
     // a different chat address (agent-shared sessions span messaging
     // groups, possibly on different platforms/instances), so the address
@@ -140,15 +173,17 @@ export function startTypingRefresh(
     // expires.
     if (entry.pausedUntil > Date.now()) return;
 
-    const withinGrace = Date.now() - entry.startedAt < TYPING_GRACE_MS;
+    const withinGrace = !entry.delivered && Date.now() - entry.startedAt < TYPING_GRACE_MS;
     if (withinGrace || isHeartbeatFresh(entry.agentGroupId, sessionId)) {
       triggerTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
       return;
     }
 
-    // Out of grace AND heartbeat stale — agent is idle, stop refreshing.
+    // Out of grace AND heartbeat stale — the turn ended (reply sent, no
+    // output, or error). Stop refreshing AND clear the indicator.
     clearInterval(entry.interval);
     typingRefreshers.delete(sessionId);
+    clearTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
   }, TYPING_REFRESH_MS);
   // unref so a stale refresher can't hold the event loop alive.
   interval.unref();
@@ -161,6 +196,7 @@ export function startTypingRefresh(
     interval,
     startedAt,
     pausedUntil: 0,
+    delivered: false,
   });
 }
 
@@ -174,11 +210,14 @@ export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
   entry.pausedUntil = Date.now() + POST_DELIVERY_PAUSE_MS;
+  entry.delivered = true;
 }
 
+/** Stop refreshing and clear the platform indicator. No-op if nothing is active. */
 export function stopTypingRefresh(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
   clearInterval(entry.interval);
   typingRefreshers.delete(sessionId);
+  clearTyping(entry.channelType, entry.platformId, entry.threadId, entry.instance).catch(() => {});
 }
