@@ -14,7 +14,7 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-typing' };
 });
 
-import { setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';
+import { pauseTypingRefreshAfterDelivery, setTypingAdapter, startTypingRefresh, stopTypingRefresh } from './index.js';
 
 type Call = { channelType: string; platformId: string; threadId: string | null; instance?: string };
 
@@ -119,5 +119,82 @@ describe('startTypingRefresh — instance forwarding', () => {
         instance: 'telegram',
       });
     }
+  });
+});
+
+describe('typing indicator is always cleared when the turn ends', () => {
+  function adapterWithClears() {
+    const fired: string[] = [];
+    const cleared: Array<{ platformId: string; threadId: string | null; instance?: string }> = [];
+    setTypingAdapter({
+      async setTyping(_channelType, platformId, threadId, instance, status) {
+        if (status === '') cleared.push({ platformId, threadId, instance });
+        else fired.push(platformId);
+      },
+    });
+    return { fired, cleared };
+  }
+
+  it('no output: grace expires with a stale heartbeat -> refresher stops AND clears the indicator', async () => {
+    const { cleared } = adapterWithClears();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1', 'slack-tester');
+    await vi.advanceTimersByTimeAsync(30_000); // no heartbeat file ever exists
+    expect(cleared).toEqual([{ platformId: 'slack:C1', threadId: 'T1', instance: 'slack-tester' }]);
+
+    // Refresher is gone: no further fires or clears.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(cleared).toHaveLength(1);
+  });
+
+  it('stopTypingRefresh (container exit / error / failed wake) clears the indicator', async () => {
+    const { cleared } = adapterWithClears();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1', 'slack-tester');
+    await vi.advanceTimersByTimeAsync(0);
+    stopTypingRefresh('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cleared).toEqual([{ platformId: 'slack:C1', threadId: 'T1', instance: 'slack-tester' }]);
+  });
+
+  it('stopTypingRefresh with no active refresher does not clear anything', async () => {
+    const { cleared } = adapterWithClears();
+    stopTypingRefresh('sess-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cleared).toHaveLength(0);
+  });
+
+  it('after a reply is delivered, typing does not re-fire inside the startup grace (would stick after the reply)', async () => {
+    const { fired, cleared } = adapterWithClears();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1', 'slack-tester');
+    await vi.advanceTimersByTimeAsync(1_000);
+    pauseTypingRefreshAfterDelivery('sess-1'); // fast reply
+    fired.length = 0;
+
+    // Pause (10s) ends at ~11s, inside the 15s grace from start. Previously a
+    // tick here re-set the status after the reply posted.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fired).toHaveLength(0);
+    expect(cleared).toHaveLength(1);
+  });
+
+  it('a new inbound after a delivery restores the grace window', async () => {
+    const { fired } = adapterWithClears();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1', 'slack-tester');
+    await vi.advanceTimersByTimeAsync(1_000);
+    pauseTypingRefreshAfterDelivery('sess-1');
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1', 'slack-tester');
+    fired.length = 0;
+    await vi.advanceTimersByTimeAsync(8_500);
+    expect(fired.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('a throwing adapter never breaks stop', async () => {
+    setTypingAdapter({
+      async setTyping(_c, _p, _t, _i, status) {
+        if (status === '') throw new Error('slack down');
+      },
+    });
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1');
+    expect(() => stopTypingRefresh('sess-1')).not.toThrow();
+    await vi.advanceTimersByTimeAsync(0);
   });
 });

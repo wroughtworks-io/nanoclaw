@@ -27,7 +27,7 @@ import {
   getMessagingGroupAgents,
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
-import { findSessionForAgent } from './db/sessions.js';
+import { findSessionForAgent, markSessionEngaged } from './db/sessions.js';
 import { backfillNewSession, fanInboundMessage } from './modules/cross-session-context/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -475,10 +475,11 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
  *                      wired to one chat, use engage_mode='pattern' with
  *                      the disambiguator as the regex.
  *   'mention-sticky' — platform mention OR an active per-thread session
- *                      already exists for this (agent, mg, thread). The
- *                      session existence IS our subscription state; once
- *                      a thread has engaged us once, follow-ups arrive
- *                      with no mention and should still fire.
+ *                      for this (agent, mg, thread) that has been ENGAGED
+ *                      (session.engaged_at: a waking message was delivered).
+ *                      Once a thread has engaged us, follow-ups arrive with
+ *                      no mention and should still fire. A session that only
+ *                      holds accumulated unmentioned context never counts.
  */
 async function evaluateEngage(
   agent: MessagingGroupAgent,
@@ -505,8 +506,11 @@ async function evaluateEngage(
       // Sticky follow-up: session already exists for this (agent, mg, thread)
       // — the thread was activated before, keep firing.
       if (mg.is_group === 0) return false; // DMs never use mention-sticky sensibly
+      // A session that merely stores accumulated context (trigger=0 rows,
+      // engaged_at NULL) is NOT a subscription — only a thread where she was
+      // actually addressed counts.
       const existing = await findSessionForAgent(agent.agent_group_id, mg.id, threadId);
-      return existing !== undefined;
+      return existing !== undefined && !!existing.engaged_at;
     }
     default:
       // Unrecognized engage_mode (e.g. stale data from a past CLI version,
@@ -607,6 +611,10 @@ async function deliverToAgent(
     content: event.message.content,
     trigger: wake,
   });
+
+  // Record real engagement only after the waking row is durably written, so
+  // sticky never outruns the message that justified it.
+  if (wake) await markSessionEngaged(session.id);
 
   if (wake) {
     // Cross-session context: fan the triggering message into sibling

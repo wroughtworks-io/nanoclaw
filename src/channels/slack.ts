@@ -17,6 +17,7 @@
 import { createSlackAdapter, type SlackAdapter } from '@chat-adapter/slack';
 
 import { readEnvFile } from '../env.js';
+import { log } from '../log.js';
 import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -126,6 +127,21 @@ export async function resolveSlackConversation(
   }
 }
 
+/**
+ * Clear the assistant "Typing…" status of a thread. Slack only auto-clears it
+ * when the app posts in the thread; an empty status clears it explicitly.
+ * Top-level (no thread ts) ids have no status to clear. Best-effort.
+ */
+export async function clearSlackStatus(slackAdapter: SlackAdapter, threadId: string): Promise<void> {
+  const [, channel, threadTs] = threadId.split(':');
+  if (!channel || !threadTs) return;
+  try {
+    await slackAdapter.setAssistantStatus(channel, threadTs, '');
+  } catch (err) {
+    log.warn('Slack status clear failed', { channel, threadTs, err });
+  }
+}
+
 /** Construction knobs for one Slack bot identity. */
 export interface SlackBridgeOptions {
   /**
@@ -179,6 +195,7 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
     concurrency: 'concurrent',
     supportsThreads: true,
     defaults: SLACK_DEFAULTS,
+    clearTyping: (threadId) => clearSlackStatus(slackAdapter, threadId),
   });
   bridge.resolveChannelName = async (platformId: string) => {
     try {

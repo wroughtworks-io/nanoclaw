@@ -167,6 +167,8 @@ export interface Session {
   requester_user_id?: string | null;
   /** Lowercase hex sha256 of the per-container-start Notion broker secret. */
   broker_token_hash?: string | null;
+  /** ISO time of the first waking (trigger=1) message; NULL = stored-context-only. Gates mention-sticky. */
+  engaged_at?: string | null;
 }
 
 // ── Session DB entities ──

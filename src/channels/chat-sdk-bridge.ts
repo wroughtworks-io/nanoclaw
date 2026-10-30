@@ -329,6 +329,12 @@ export interface ChatSdkBridgeConfig {
    */
   supportsThreads: boolean;
   /**
+   * Clear the typing/status indicator for a thread. Only for platforms whose
+   * indicator does not expire on its own (Slack assistant status, which
+   * auto-clears solely when a message is posted). Omitted = clear is a no-op.
+   */
+  clearTyping?: (threadId: string) => Promise<void>;
+  /**
    * Declared wiring-time defaults for this channel. Copied verbatim onto the
    * returned ChannelAdapter, exactly like supportsThreads. See
    * `ChannelAdapter.defaults`.
@@ -913,8 +919,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
     },
 
-    async setTyping(platformId: string, threadId: string | null) {
+    async setTyping(platformId: string, threadId: string | null, status?: string) {
       const tid = threadId ?? platformId;
+      if (status === '') {
+        // Clear request. Never fall through to startTyping — on most
+        // platforms that would (re)start the indicator. Platforms whose
+        // indicator doesn't self-expire supply `clearTyping`; the rest no-op.
+        await config.clearTyping?.(tid);
+        return;
+      }
       await adapter.startTyping(tid);
     },
 
