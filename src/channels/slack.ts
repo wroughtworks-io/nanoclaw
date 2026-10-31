@@ -63,7 +63,10 @@ export const SLACK_DEFAULTS: ChannelDefaults = {
     unknownSenderPolicy: 'decline_notify',
   },
   group: {
-    engageMode: 'mention-sticky',
+    // Wroughtworks: channels engage on explicit @mention only — several people
+    // talk in one thread, and a sticky agent interrupts them. Thread continuity
+    // comes from accumulate + the opt-in Slack context fetch instead.
+    engageMode: 'mention',
     threads: true,
     // D29: group conversations are per-thread too — Slack channels
     // materialize a thread per top-level message, and ambient context

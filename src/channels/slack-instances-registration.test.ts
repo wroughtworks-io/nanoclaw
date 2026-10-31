@@ -68,7 +68,7 @@ describe('slack multi-instance registration', () => {
       // group.threads true is SLACK_DEFAULTS; the no-live-adapter fallback
       // would resolve threads:false. Engagement fields ride along.
       expect(defaults.group.threads).toBe(true);
-      expect(defaults.group.engageMode).toBe('mention-sticky');
+      expect(defaults.group.engageMode).toBe('mention');
       expect(defaults.dm).toMatchObject({ engageMode: 'pattern', engagePattern: '.', threads: false });
       expect(defaults.mentions).toBe('platform');
     }

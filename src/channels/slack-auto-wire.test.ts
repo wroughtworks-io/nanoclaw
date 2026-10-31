@@ -14,7 +14,7 @@
  *    not; an unidentifiable sender does not
  *  - the two surfaces are independently switchable and never borrow each
  *    other's target
- *  - a wired channel takes Slack's DECLARED group semantics (mention-sticky,
+ *  - a wired channel takes Slack's DECLARED group semantics (mention,
  *    per-thread, threads honored) — not the DM stamp
  *  - both gates open: wiring + unknown_sender_policy → 'public'
  *  - idempotence on redelivery, and unknown target → card
@@ -286,7 +286,7 @@ describe('slack auto-wire — channel surface', () => {
 
     const [row] = await wiringsFor(mg.id);
     // SLACK_DEFAULTS.group — sticky engagement, bounded per thread.
-    expect(row.engage_mode).toBe('mention-sticky');
+    expect(row.engage_mode).toBe('mention');
     expect(row.session_mode).toBe('per-thread');
     expect(row.threads).toBe(1);
     expect(row.sender_scope).toBe('all');
