@@ -56,7 +56,11 @@ import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import type { AgentGroup, MessagingGroup } from '../../types.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
-import { createPendingChannelApproval, hasInFlightChannelApproval } from './db/pending-channel-approvals.js';
+import {
+  createPendingChannelApproval,
+  deletePendingChannelApproval,
+  hasInFlightChannelApproval,
+} from './db/pending-channel-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 
 // ── Value constants (response handler in index.ts parses these) ──
@@ -344,6 +348,10 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
         question,
         options,
       }),
+      undefined,
+      // The DM row belongs to one bot identity; on a multi-instance box there
+      // is no adapter under the bare channel type, so omitting this fails.
+      delivery.messagingGroup.instance,
     );
     log.info('Channel registration card delivered', {
       messagingGroupId,
@@ -352,6 +360,10 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     });
   } catch (err) {
     log.error('Channel registration card delivery failed', { messagingGroupId, err });
+    // Nobody saw the card, so nobody can answer it. Left in place, the row
+    // trips the in-flight dedupe above and silences every later mention —
+    // an admin's included — before the interceptor can auto-wire.
+    await deletePendingChannelApproval(messagingGroupId);
   }
 }
 

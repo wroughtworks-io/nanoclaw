@@ -219,6 +219,29 @@ describe('unknown-channel registration flow', () => {
     expect(count).toBe(1);
   });
 
+  it("delivers through the approver DM's own adapter instance", async () => {
+    // Multi-instance boxes (one bot per agent) register no adapter under the
+    // bare channel type; a card sent without the instance has nowhere to go.
+    await getDb().run(`UPDATE messaging_groups SET instance = 'telegram-klara' WHERE id = 'mg-dm-owner'`);
+    const { routeInbound } = await import('../../router.js');
+    await expectAsyncDelivery(() => routeInbound(groupMention('chat-instance')));
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(deliverMock.mock.calls[0][6]).toBe('telegram-klara');
+  });
+
+  it('a failed card delivery clears the row so the next mention escalates again', async () => {
+    const { routeInbound } = await import('../../router.js');
+    deliverMock.mockRejectedValueOnce(new Error("No adapter registered for 'telegram'"));
+    await expectAsyncDelivery(() => routeInbound(groupMention('chat-undelivered')));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(await countRows('SELECT COUNT(*) AS c FROM pending_channel_approvals')).toBe(0);
+
+    await expectAsyncDelivery(() => routeInbound(groupMention('chat-undelivered', '@bot again')));
+    expect(deliverMock).toHaveBeenCalledTimes(2);
+    expect(await countRows('SELECT COUNT(*) AS c FROM pending_channel_approvals')).toBe(1);
+  });
+
   it('approve → creates wiring, admits triggering sender, replays', async () => {
     const { routeInbound } = await import('../../router.js');
     const { getResponseHandlers } = await import('../../response-registry.js');
