@@ -185,6 +185,33 @@ export interface ChannelDefaults {
   mentions: 'platform' | 'dm-only' | 'never';
 }
 
+/** One message of fetched conversation history (platform-neutral). */
+export interface ConversationContextMessage {
+  /** Platform message id (Slack ts) — the dedupe key against delivered rows. */
+  id: string;
+  sender: string;
+  senderId?: string;
+  /** Authored by this agent's own bot identity. */
+  isSelf: boolean;
+  text: string;
+  /** ISO-8601. */
+  timestamp: string;
+}
+
+export interface ConversationContextRequest {
+  platformId: string;
+  threadId: string | null;
+  /** Platform id of the message that engaged the agent (excluded from the result). */
+  messageId: string;
+}
+
+export interface ConversationContext {
+  /** 'thread' = replies of a thread (messages[0] is the root when present); 'channel' = recent top-level history. */
+  source: 'thread' | 'channel';
+  /** Chronological, oldest first. */
+  messages: ConversationContextMessage[];
+}
+
 /** The v2 channel adapter contract. */
 export interface ChannelAdapter {
   name: string;
@@ -228,6 +255,15 @@ export interface ChannelAdapter {
   ): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
   resolveChannelName?(platformId: string): Promise<string | null>;
+
+  /**
+   * Fetch the conversation history around an engaging mention (Slack:
+   * conversations.replies / conversations.history), for hosts that opt a
+   * group in. Budgeting, dedupe and rendering happen host-side
+   * (src/conversation-context.ts); the adapter only fetches and normalizes.
+   * Rejects on platform errors — the caller fails soft.
+   */
+  fetchConversationContext?(req: ConversationContextRequest): Promise<ConversationContext>;
 
   /**
    * Set a human-readable title on a conversation thread. Platforms with a

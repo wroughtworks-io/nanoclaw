@@ -35,6 +35,8 @@ export interface ContainerConfigRow {
   runtime_tier?: string | null;
   /** 1 = agent opts in to the per-requester Notion broker MCP server (migration 024). */
   notion_broker?: number;
+  /** 1 = agent opts in to fetching Slack thread/channel history on a mention (migration 026). */
+  slack_context_fetch?: number;
   updated_at: string;
 }
 
