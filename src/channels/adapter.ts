@@ -253,6 +253,18 @@ export interface ChannelAdapter {
     status?: string,
     statusKind?: 'auto' | 'agent',
   ): Promise<void>;
+  /**
+   * Add (or, with `remove`, delete) an emoji reaction on a message. Used by the
+   * instant-ack module; rejects on platform errors (callers are best-effort).
+   * Emoji is a platform-neutral name such as 'eyes' or 'warning'.
+   */
+  react?(
+    platformId: string,
+    threadId: string | null,
+    messageId: string,
+    emoji: string,
+    remove?: boolean,
+  ): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
   resolveChannelName?(platformId: string): Promise<string | null>;
 

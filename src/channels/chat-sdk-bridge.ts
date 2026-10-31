@@ -919,6 +919,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
     },
 
+    async react(platformId: string, threadId: string | null, messageId: string, emoji: string, remove?: boolean) {
+      const tid = threadId ?? platformId;
+      if (remove) await adapter.removeReaction(tid, messageId, emoji);
+      else await adapter.addReaction(tid, messageId, emoji);
+    },
+
     async setTyping(platformId: string, threadId: string | null, status?: string) {
       const tid = threadId ?? platformId;
       if (status === '') {
