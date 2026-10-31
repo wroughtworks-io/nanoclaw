@@ -43,6 +43,7 @@ import { omittedMarker, renderContextBlock, selectWithinBudget } from './convers
 import { findSessionForAgent } from './db/sessions.js';
 import { wakeContainer } from './container-runner.js';
 import { routeInbound } from './router.js';
+import { parseIsoTimestamp } from './mailbox/model.js';
 import { withExistingMailboxSession } from './session-manager.js';
 import { log } from './log.js';
 
@@ -254,6 +255,12 @@ async function sessionRows(threadId: string): Promise<Array<{ kind: string; cont
 const contextRows = async (threadId: string) =>
   (await sessionRows(threadId)).filter((r) => String(r.content.text ?? '').startsWith('<slack_context'));
 
+async function pendingRows(threadId: string) {
+  const s = (await findSessionForAgent('ag-1', 'mg-1', threadId))!;
+  const rows = await withExistingMailboxSession('ag-1', s.id, (mb) => mb.getInboundDeliveryState(500));
+  return (rows ?? []).filter((r) => r.status === 'pending');
+}
+
 const ctx = (source: 'thread' | 'channel', messages: ConversationContextMessage[]): ConversationContext => ({
   source,
   messages,
@@ -304,9 +311,9 @@ describe('router: Slack context on mention', () => {
     expect(String(rows[0].content.text)).toContain('<slack_context source="channel">');
   });
 
-  it('dedupes against accumulated messages already stored in the session (by id)', async () => {
+  it('pending accumulated rows are NOT seen: the block covers them and they are retired, not re-delivered', async () => {
     await seed(true);
-    // Two untagged replies are stored as context (trigger=0) first.
+    // Two untagged replies are stored as pending context (trigger=0) first.
     await inbound('1001.000100', 'testchat:C1:900.1', false);
     await inbound('1002.000100', 'testchat:C1:900.1', false);
     expect(wakeContainer).not.toHaveBeenCalled();
@@ -317,18 +324,88 @@ describe('router: Slack context on mention', () => {
     const rows = await contextRows('testchat:C1:900.1');
     expect(rows).toHaveLength(1);
     const text = String(rows[0].content.text);
-    expect(text).toContain('message number 0');
-    expect(text).toContain('message number 3');
-    expect(text).not.toContain('message number 1\n');
-    expect(text).not.toContain('message number 2');
-    expect(rows[0].content.contextIds).toEqual(['1000.000100', '1003.000100']);
+    for (const i of [0, 1, 2, 3]) expect(text).toContain(`message number ${i}`);
+    expect(rows[0].content.contextIds).toEqual(['1000.000100', '1001.000100', '1002.000100', '1003.000100']);
+    // Only the context row and the mention remain deliverable.
+    expect((await pendingRows('testchat:C1:900.1')).map((r) => r.kind)).toHaveLength(2);
 
-    // A second mention does not repeat what the first block already carried.
+    // A second mention: only messages since the last delivery are new.
     fetchContext.mockResolvedValue(ctx('thread', [...many(4), msg(9)]));
     await inbound('m-trigger-2', 'testchat:C1:900.1', true);
     const second = (await contextRows('testchat:C1:900.1')).at(-1)!;
-    expect(String(second.content.text)).toContain('message number 9');
+    expect(second.content.contextIds).toEqual(['1009.000100']);
     expect(String(second.content.text)).not.toContain('message number 3');
+  });
+
+  it('staging scenario: root + 10 untagged replies pending, then a mention, cap 10', async () => {
+    await seed(true);
+    const T = 'testchat:C1:1000.000100';
+    const thread = many(11); // root + 10 replies, ids 1000..1010
+    for (const m of thread) await inbound(m.id, T, false);
+    expect(await pendingRows(T)).toHaveLength(11);
+
+    fetchContext.mockResolvedValue(ctx('thread', thread));
+    await inbound('m-mention', T, true);
+
+    const rows = await contextRows(T);
+    expect(rows).toHaveLength(1);
+    const text = String(rows[0].content.text);
+    expect(text).toContain('message number 0'); // the root
+    expect(text).toContain('message number 1'); // the key first reply
+    expect(rows[0].content.contextIds).toHaveLength(11);
+
+    // What the container would poll (status=pending): one context row + the mention.
+    // The 11 covered rows are retired, so the cap of 10 cannot cut anything visible.
+    const pending = await pendingRows(T);
+    expect(pending).toHaveLength(2);
+    const pendingIds = pending.map((r) => JSON.parse(r.content) as Record<string, unknown>);
+    expect(pendingIds.some((c) => Array.isArray(c.contextIds))).toBe(true);
+    expect(pendingIds.some((c) => c.id === 'm-mention')).toBe(true);
+    expect(pending.filter((r) => r.trigger)).toHaveLength(1); // the mention still wakes
+    expect(pendingIds.some((c) => typeof c.id === 'string' && c.id.startsWith('100'))).toBe(false);
+    expect(log.info).toHaveBeenCalledWith(
+      'Conversation context injected',
+      expect.objectContaining({ fetched: 11, fresh: 11, kept: 11, omitted: 0, pendingRowsCovered: 11 }),
+    );
+  });
+
+  it('already-delivered (completed) rows ARE seen', async () => {
+    await seed(true);
+    const T = 'testchat:C1:1000.000100';
+    await inbound('1001.000100', T, false);
+    const s = (await findSessionForAgent('ag-1', 'mg-1', T))!;
+    // Simulate the container having consumed it in an earlier turn (host ack sync => completed).
+    const rowId = (await withExistingMailboxSession('ag-1', s.id, (mb) => mb.getInboundDeliveryState(10)))![0].id;
+    await withExistingMailboxSession('ag-1', s.id, (mb) => {
+      mb.applyProcessingAcks([{ messageId: rowId, status: 'completed', statusChanged: parseIsoTimestamp(now()) }]);
+    });
+    fetchContext.mockResolvedValue(ctx('thread', many(3))); // 1000, 1001, 1002
+    await inbound('m-mention', T, true);
+    const rows = await contextRows(T);
+    expect(rows[0].content.contextIds).toEqual(['1000.000100', '1002.000100']);
+  });
+
+  it('logs why nothing was injected: nothing new, no adapter method', async () => {
+    await seed(true);
+    const T = 'testchat:C1:1000.000100';
+    fetchContext.mockResolvedValue(ctx('thread', []));
+    await inbound('m1', T, true);
+    expect(log.info).toHaveBeenCalledWith(
+      expect.stringContaining('nothing new to add'),
+      expect.objectContaining({ fetched: 0 }),
+    );
+    const { injectConversationContext } = await import('./conversation-context.js');
+    const base = {
+      agentGroupId: 'ag-1',
+      sessionId: 's',
+      platformId: 'p',
+      threadId: null,
+      messageId: 'x',
+      messageTimestamp: now(),
+      channelType: 'testchat',
+    };
+    expect(await injectConversationContext({ ...base, adapter: undefined })).toBe(false);
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('no fetchConversationContext'), expect.anything());
   });
 
   it('fetch failure falls back to current behaviour without throwing', async () => {
@@ -341,6 +418,16 @@ describe('router: Slack context on mention', () => {
       'Conversation context fetch failed — continuing without it',
       expect.objectContaining({ err: 'not_in_channel' }),
     );
+  });
+
+  it('fetch failure leaves the pending accumulated rows untouched', async () => {
+    await seed(true);
+    const T = 'testchat:C1:900.1';
+    for (const m of many(3)) await inbound(m.id, T, false);
+    fetchContext.mockRejectedValue(new Error('ratelimited'));
+    await inbound('m-trigger', T, true);
+    expect(await contextRows(T)).toHaveLength(0);
+    expect(await pendingRows(T)).toHaveLength(4); // 3 accumulated + the mention
   });
 
   it('a hung fetch times out (short timeout) and the message still delivers', async () => {

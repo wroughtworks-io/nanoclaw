@@ -11,13 +11,15 @@
  * Everything here fails soft: any error, timeout or empty result leaves the
  * delivery exactly as it was without the feature. Never throws.
  *
- * Dedupe: messages already present in this session's mailbox (accumulated
- * context rows, or earlier turns), matched by platform message id, are
- * DROPPED FROM THE FETCHED SET rather than replacing the stored rows. Those
- * rows are already being delivered; deleting them would mean mutating the
- * session mailbox on a best-effort path, and a failed fetch would then lose
- * context the old behaviour kept. Dropping is non-destructive and makes the
- * feature strictly additive: the agent sees stored rows + the missing rest.
+ * Dedupe: "already seen" means ACTUALLY DELIVERED to the agent in an earlier
+ * turn (rows completed/processing, plus contextIds of earlier context rows),
+ * matched by platform message id. Pending accumulated rows have not reached
+ * the agent: the context block covers them, and once the block row is durable
+ * those pending rows are retired host-side (status 'completed', conditional on
+ * still-pending trigger=0) so they are not delivered twice and do not consume
+ * the container's per-prompt row cap. The container's poll only reads
+ * status='pending', so no container change is needed. A failed fetch marks
+ * nothing and leaves exactly the pre-feature behaviour.
  */
 import type {
   ChannelAdapter,
@@ -113,23 +115,61 @@ export function renderContextBlock(
   return { text, kept };
 }
 
-/** Platform message ids already present in the session's mailbox (any status). */
-async function deliveredIds(agentGroupId: string, sessionId: string): Promise<Set<string>> {
-  const ids = new Set<string>();
-  const history = await withExistingMailboxSession(agentGroupId, sessionId, (mb) =>
-    mb.getInboundHistory(DEDUPE_HISTORY_ROWS),
+interface MailboxIdState {
+  /** Platform message ids the agent has (or will, unconditionally) receive without our help. */
+  seen: Set<string>;
+  /** Pending accumulated rows the context block may absorb: platform message id -> mailbox row ids. */
+  coverable: Map<string, string[]>;
+}
+
+/** Row channel types that carry copies of other sessions' traffic, not this thread's own messages. */
+const NON_OWN_CHANNEL_TYPES = new Set(['session-echo', 'agent']);
+
+/**
+ * Classify this session's inbound rows by what the agent has actually been given.
+ *
+ * "Seen" = delivered in an earlier turn: status completed/processing (the container claimed it),
+ * plus the contextIds of earlier context rows that were delivered or are queued to be. A PENDING
+ * trigger=0 accumulated row has NOT reached the agent and is not seen — it is "coverable" instead
+ * (the context block absorbs it and the row is retired afterwards). Pending rows we must not
+ * absorb (waking rows, echo/agent copies, earlier context rows) will be delivered on their own,
+ * so their ids count as seen to avoid duplicating them. failed/cancelled rows were never
+ * delivered and are not seen.
+ */
+async function classifyMailboxIds(agentGroupId: string, sessionId: string): Promise<MailboxIdState> {
+  const seen = new Set<string>();
+  const coverable = new Map<string, string[]>();
+  const rows = await withExistingMailboxSession(agentGroupId, sessionId, (mb) =>
+    mb.getInboundDeliveryState(DEDUPE_HISTORY_ROWS),
   );
-  for (const row of history ?? []) {
+  for (const row of rows ?? []) {
+    if (row.status === 'failed' || row.status === 'cancelled') continue;
+    let c: { id?: unknown; contextIds?: unknown };
     try {
-      const c = JSON.parse(row.content) as { id?: unknown; contextIds?: unknown };
-      if (typeof c.id === 'string' && c.id) ids.add(c.id);
-      // A previous context block's messages count as delivered too (re-mention in the same thread).
-      if (Array.isArray(c.contextIds)) for (const id of c.contextIds) if (typeof id === 'string') ids.add(id);
+      c = JSON.parse(row.content) as { id?: unknown; contextIds?: unknown };
     } catch {
-      // non-JSON content (system rows) carries no platform id
+      continue; // non-JSON content (system rows) carries no platform id
+    }
+    if (c === null || typeof c !== 'object') continue;
+    const isContextRow = Array.isArray(c.contextIds);
+    // A previous context block's messages count as delivered (or queued for delivery) too.
+    if (isContextRow) for (const id of c.contextIds as unknown[]) if (typeof id === 'string') seen.add(id);
+    if (typeof c.id !== 'string' || !c.id) continue;
+    const absorbable =
+      row.status === 'pending' &&
+      !row.trigger &&
+      !isContextRow &&
+      (row.kind === 'chat' || row.kind === 'chat-sdk') &&
+      !NON_OWN_CHANNEL_TYPES.has(row.channelType ?? '');
+    if (absorbable) {
+      const list = coverable.get(c.id) ?? [];
+      list.push(row.id);
+      coverable.set(c.id, list);
+    } else {
+      seen.add(c.id);
     }
   }
-  return ids;
+  return { seen, coverable };
 }
 
 function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
@@ -163,7 +203,14 @@ export interface InjectContextParams {
  */
 export async function injectConversationContext(p: InjectContextParams): Promise<boolean> {
   try {
-    if (!p.adapter?.fetchConversationContext) return false;
+    const where = { sessionId: p.sessionId, platformId: p.platformId, threadId: p.threadId };
+    if (!p.adapter?.fetchConversationContext) {
+      log.info('Conversation context skipped: channel adapter has no fetchConversationContext', {
+        ...where,
+        adapter: p.adapter ? (p.adapter.instance ?? p.adapter.channelType) : 'none registered',
+      });
+      return false;
+    }
     const req: ConversationContextRequest = {
       platformId: p.platformId,
       threadId: p.threadId,
@@ -173,18 +220,34 @@ export async function injectConversationContext(p: InjectContextParams): Promise
     try {
       ctx = await withTimeout(p.adapter.fetchConversationContext(req), p.timeoutMs ?? CONTEXT_FETCH_TIMEOUT_MS);
     } catch (err) {
+      // Nothing has been marked at this point: behaviour is exactly the pre-feature path.
       log.warn('Conversation context fetch failed — continuing without it', {
-        platformId: p.platformId,
-        threadId: p.threadId,
+        ...where,
         err: err instanceof Error ? err.message : String(err),
       });
       return false;
     }
 
-    const seen = await deliveredIds(p.agentGroupId, p.sessionId);
+    const { seen, coverable } = await classifyMailboxIds(p.agentGroupId, p.sessionId);
     const fresh = ctx.messages.filter((m) => m.id !== p.messageId && !seen.has(m.id));
+    if (fresh.length === 0) {
+      log.info('Conversation context skipped: nothing new to add (every fetched message was already delivered)', {
+        ...where,
+        source: ctx.source,
+        fetched: ctx.messages.length,
+      });
+      return false;
+    }
     const rendered = renderContextBlock(ctx.source, fresh, p.budget);
-    if (!rendered) return false;
+    if (!rendered) {
+      log.info('Conversation context skipped: rendered block was empty', {
+        ...where,
+        source: ctx.source,
+        fetched: ctx.messages.length,
+        fresh: fresh.length,
+      });
+      return false;
+    }
 
     const ts = new Date(Date.parse(p.messageTimestamp) - 1);
     await writeSessionMessage(p.agentGroupId, p.sessionId, {
@@ -201,11 +264,34 @@ export async function injectConversationContext(p: InjectContextParams): Promise
       }),
       trigger: false,
     });
+
+    // Retire the pending accumulated rows the block now carries, so they are not delivered a second
+    // time (and do not eat the container's per-prompt row cap). Strictly AFTER the context row is
+    // durable: a crash in between duplicates, never loses. Best-effort: a failure here leaves
+    // today's behaviour (duplicates), never an error.
+    const coveredRowIds = rendered.kept.flatMap((m) => coverable.get(m.id) ?? []);
+    let covered = 0;
+    if (coveredRowIds.length > 0) {
+      try {
+        covered =
+          (await withExistingMailboxSession(p.agentGroupId, p.sessionId, (mb) =>
+            mb.markPendingContextHandled(coveredRowIds),
+          )) ?? 0;
+      } catch (err) {
+        log.warn('Conversation context: could not retire covered pending rows — they will also be delivered', {
+          ...where,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
     log.info('Conversation context injected', {
-      sessionId: p.sessionId,
+      ...where,
       source: ctx.source,
       fetched: ctx.messages.length,
-      deduped: ctx.messages.length - fresh.length,
+      fresh: fresh.length,
+      kept: rendered.kept.length,
+      omitted: fresh.length - rendered.kept.length,
+      pendingRowsCovered: covered,
     });
     return true;
   } catch (err) {

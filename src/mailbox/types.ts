@@ -84,6 +84,16 @@ export interface MailboxHistoryMessage {
   content: string;
 }
 
+/** One inbound row as the dedupe/handled logic needs it (newest-first from getInboundDeliveryState). */
+export interface MailboxDeliveryState {
+  id: string;
+  kind: string;
+  channelType: string | null;
+  status: string;
+  trigger: boolean;
+  content: string;
+}
+
 export interface MailboxTimelineMessage {
   timestamp: string;
   content: string;
@@ -119,6 +129,15 @@ export interface InboundMailbox {
   countLiveTasks(): number;
   prunePendingMessages(channelType: string, before: string, keep: number): number;
   getInboundHistory(limit: number): MailboxHistoryMessage[];
+  /** Newest-first rows with id/status/trigger, for "was this actually delivered?" decisions. */
+  getInboundDeliveryState(limit: number): MailboxDeliveryState[];
+  /**
+   * Retire still-pending, trigger=0 rows (host-side `completed`, the same terminal state the
+   * processing-ack sync gives consumed rows) so the container's pending poll never picks them up.
+   * Conditional on status='pending' AND trigger=0: a row the container already claimed, or a
+   * waking row, is never touched. Returns the number of rows changed.
+   */
+  markPendingContextHandled(rowIds: string[]): number;
   getConversationRoot(): MailboxTimelineMessage | undefined;
   findTaskBySeriesSlug(slug: string): TaskRecord | undefined;
 }
