@@ -32,8 +32,15 @@ slack_context_fetch = 1 WHERE agent_group_id = '<id>';` on the central DB.
   the tags escaped; this also stops message text from forging a closing tag.)
 - Names: the Chat SDK adapter resolves `users.info` display names (cached in its state store); the
   agent's own messages are marked `you (<name>)`.
-- Dedupe: fetched messages whose Slack ts is already in the session (accumulated rows, earlier turns,
-  or an earlier context block) are dropped from the fetched set; stored rows are never modified.
+- No cross-turn dedupe: every injection renders the FULL fetched thread (or channel window) within the
+  budget, excluding only the waking message. Session memory is not reliable (restarts, transcript
+  rotation, `/clear`), so earlier delivery never implies the agent still remembers. The agent's own
+  earlier messages stay in, marked `you (<name>)`.
+- Within one prompt nothing is delivered twice: pending `trigger=0` rows the block carries (accumulated
+  untagged messages, and an earlier still-pending context block) are retired host-side once the block
+  row is durable (conditional on still pending). Pending rows the block omitted for budget are left
+  pending and delivered as ordinary rows (real content the block lacks; losing it would be worse).
+- Log: `Conversation context injected` reports `fetched`, `kept`, `omitted`, `pendingRowsCovered`.
 - Fail soft: any Slack error (`missing_scope`, `not_in_channel`, rate limit, ...) or a 3 s timeout logs
   a warning (`Conversation context fetch failed`) and delivery proceeds as without the feature.
 - Known limit (Chat SDK / Slack API): in threads over ~200 replies the newest-first window is taken

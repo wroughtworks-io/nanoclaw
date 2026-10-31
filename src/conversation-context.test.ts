@@ -1,7 +1,7 @@
 /**
  * Conversation context on mention: budget/render unit tests, the Slack fetcher
  * (Chat SDK adapter mocked), and the REAL routeInbound path with the setting
- * on/off, dedupe, fail-soft, and the untagged-doesn't-wake regression.
+ * on/off, full-thread injection, fail-soft, and the untagged-doesn't-wake regression.
  */
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
@@ -311,9 +311,8 @@ describe('router: Slack context on mention', () => {
     expect(String(rows[0].content.text)).toContain('<slack_context source="channel">');
   });
 
-  it('pending accumulated rows are NOT seen: the block covers them and they are retired, not re-delivered', async () => {
+  it('pending accumulated rows covered by the block are retired, not re-delivered', async () => {
     await seed(true);
-    // Two untagged replies are stored as pending context (trigger=0) first.
     await inbound('1001.000100', 'testchat:C1:900.1', false);
     await inbound('1002.000100', 'testchat:C1:900.1', false);
     expect(wakeContainer).not.toHaveBeenCalled();
@@ -325,16 +324,9 @@ describe('router: Slack context on mention', () => {
     expect(rows).toHaveLength(1);
     const text = String(rows[0].content.text);
     for (const i of [0, 1, 2, 3]) expect(text).toContain(`message number ${i}`);
-    expect(rows[0].content.contextIds).toEqual(['1000.000100', '1001.000100', '1002.000100', '1003.000100']);
+    expect(rows[0].content.contextIds).toBeUndefined();
     // Only the context row and the mention remain deliverable.
-    expect((await pendingRows('testchat:C1:900.1')).map((r) => r.kind)).toHaveLength(2);
-
-    // A second mention: only messages since the last delivery are new.
-    fetchContext.mockResolvedValue(ctx('thread', [...many(4), msg(9)]));
-    await inbound('m-trigger-2', 'testchat:C1:900.1', true);
-    const second = (await contextRows('testchat:C1:900.1')).at(-1)!;
-    expect(second.content.contextIds).toEqual(['1009.000100']);
-    expect(String(second.content.text)).not.toContain('message number 3');
+    expect(await pendingRows('testchat:C1:900.1')).toHaveLength(2);
   });
 
   it('staging scenario: root + 10 untagged replies pending, then a mention, cap 10', async () => {
@@ -352,37 +344,105 @@ describe('router: Slack context on mention', () => {
     const text = String(rows[0].content.text);
     expect(text).toContain('message number 0'); // the root
     expect(text).toContain('message number 1'); // the key first reply
-    expect(rows[0].content.contextIds).toHaveLength(11);
+    expect(text).toContain('message number 10');
 
     // What the container would poll (status=pending): one context row + the mention.
-    // The 11 covered rows are retired, so the cap of 10 cannot cut anything visible.
     const pending = await pendingRows(T);
     expect(pending).toHaveLength(2);
-    const pendingIds = pending.map((r) => JSON.parse(r.content) as Record<string, unknown>);
-    expect(pendingIds.some((c) => Array.isArray(c.contextIds))).toBe(true);
-    expect(pendingIds.some((c) => c.id === 'm-mention')).toBe(true);
+    const pendingContent = pending.map((r) => JSON.parse(r.content) as Record<string, unknown>);
+    expect(pendingContent.some((c) => String(c.text ?? '').startsWith('<slack_context'))).toBe(true);
+    expect(pendingContent.some((c) => c.id === 'm-mention')).toBe(true);
     expect(pending.filter((r) => r.trigger)).toHaveLength(1); // the mention still wakes
-    expect(pendingIds.some((c) => typeof c.id === 'string' && c.id.startsWith('100'))).toBe(false);
     expect(log.info).toHaveBeenCalledWith(
       'Conversation context injected',
-      expect.objectContaining({ fetched: 11, fresh: 11, kept: 11, omitted: 0, pendingRowsCovered: 11 }),
+      expect.objectContaining({ fetched: 11, kept: 11, omitted: 0, pendingRowsCovered: 11 }),
     );
   });
 
-  it('already-delivered (completed) rows ARE seen', async () => {
+  it('re-mention after earlier turns (rows completed): the block holds ALL thread messages, own answer marked "you"', async () => {
     await seed(true);
     const T = 'testchat:C1:1000.000100';
-    await inbound('1001.000100', T, false);
+    const thread = [...many(13)];
+    thread[3] = msg(3, { isSelf: true, sender: 'Klára' }); // her earlier answer
+    // Earlier turns: replies 1..3 were delivered and completed (session memory since lost).
+    for (const i of [1, 2, 3]) await inbound(thread[i].id, T, false);
     const s = (await findSessionForAgent('ag-1', 'mg-1', T))!;
-    // Simulate the container having consumed it in an earlier turn (host ack sync => completed).
-    const rowId = (await withExistingMailboxSession('ag-1', s.id, (mb) => mb.getInboundDeliveryState(10)))![0].id;
+    const ids = (await withExistingMailboxSession('ag-1', s.id, (mb) => mb.getInboundDeliveryState(10)))!.map(
+      (r) => r.id,
+    );
     await withExistingMailboxSession('ag-1', s.id, (mb) => {
-      mb.applyProcessingAcks([{ messageId: rowId, status: 'completed', statusChanged: parseIsoTimestamp(now()) }]);
+      mb.applyProcessingAcks(
+        ids.map((messageId) => ({ messageId, status: 'completed', statusChanged: parseIsoTimestamp(now()) })),
+      );
     });
-    fetchContext.mockResolvedValue(ctx('thread', many(3))); // 1000, 1001, 1002
-    await inbound('m-mention', T, true);
+    expect(await pendingRows(T)).toHaveLength(0);
+
+    fetchContext.mockResolvedValue(ctx('thread', [...thread, msg(13)])); // 14 fetched incl. waking
+    await inbound(msg(13).id, T, true);
+
     const rows = await contextRows(T);
-    expect(rows[0].content.contextIds).toEqual(['1000.000100', '1002.000100']);
+    expect(rows).toHaveLength(1);
+    const text = String(rows[0].content.text);
+    for (let i = 0; i < 13; i++) expect(text).toContain(`message number ${i}`);
+    expect(text).not.toContain('message number 13'); // the waking message itself is excluded
+    expect(text).toContain('you (Klára)');
+    expect(log.info).toHaveBeenCalledWith(
+      'Conversation context injected',
+      expect.objectContaining({ fetched: 14, kept: 13, omitted: 0, pendingRowsCovered: 0 }),
+    );
+  });
+
+  it('a second mention re-sends the full thread and supersedes the still-pending earlier block', async () => {
+    await seed(true);
+    const T = 'testchat:C1:900.1';
+    fetchContext.mockResolvedValue(ctx('thread', many(4)));
+    await inbound('m-1', T, true);
+    fetchContext.mockResolvedValue(ctx('thread', [...many(4), msg(9)]));
+    await inbound('m-2', T, true);
+    const rows = await contextRows(T);
+    expect(rows).toHaveLength(2); // history keeps both rows...
+    const latest = String(rows[1].content.text);
+    for (const i of [0, 1, 2, 3, 9]) expect(latest).toContain(`message number ${i}`);
+    // ...but only the newest block is still deliverable (no duplicate blocks in one prompt).
+    const pending = (await pendingRows(T)).map((r) => JSON.parse(r.content) as Record<string, unknown>);
+    expect(pending.filter((c) => String(c.text ?? '').startsWith('<slack_context'))).toHaveLength(1);
+  });
+
+  it('budget truncation: omitted pending rows are NOT retired and stay deliverable', async () => {
+    await seed(true);
+    const T = 'testchat:C1:1000.000100';
+    const thread = many(8);
+    for (const m of thread) await inbound(m.id, T, false);
+    fetchContext.mockResolvedValue(ctx('thread', thread));
+    const { injectConversationContext } = await import('./conversation-context.js');
+    const s = (await findSessionForAgent('ag-1', 'mg-1', T))!;
+    await injectConversationContext({
+      adapter: { ...makeAdapter() },
+      agentGroupId: 'ag-1',
+      sessionId: s.id,
+      platformId: 'testchat:C1',
+      threadId: T,
+      messageId: 'm-mention',
+      messageTimestamp: now(),
+      channelType: 'testchat',
+      budget: { maxMessages: 4 },
+    });
+    const text = String((await contextRows(T))[0].content.text);
+    expect(text).toContain(omittedMarker(4));
+    expect(text).toContain('message number 0'); // root kept
+    expect(text).not.toContain('message number 1');
+    // 4 kept rows retired; the 4 omitted (1..4) stay pending, plus the block row.
+    const pending = (await pendingRows(T)).map((r) => JSON.parse(r.content) as Record<string, unknown>);
+    expect(
+      pending
+        .filter((c) => typeof c.id === 'string')
+        .map((c) => c.id)
+        .sort(),
+    ).toEqual(thread.slice(1, 5).map((m) => m.id));
+    expect(log.info).toHaveBeenCalledWith(
+      'Conversation context injected',
+      expect.objectContaining({ fetched: 8, kept: 4, omitted: 4, pendingRowsCovered: 4 }),
+    );
   });
 
   it('logs why nothing was injected: nothing new, no adapter method', async () => {
@@ -391,7 +451,7 @@ describe('router: Slack context on mention', () => {
     fetchContext.mockResolvedValue(ctx('thread', []));
     await inbound('m1', T, true);
     expect(log.info).toHaveBeenCalledWith(
-      expect.stringContaining('nothing new to add'),
+      expect.stringContaining('nothing to add'),
       expect.objectContaining({ fetched: 0 }),
     );
     const { injectConversationContext } = await import('./conversation-context.js');
