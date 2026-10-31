@@ -53,6 +53,7 @@ import {
 import type {
   AgentMailbox,
   InboundMailbox,
+  MailboxDeliveryState,
   MailboxHistoryMessage,
   MailboxSession,
   MailboxSessionKey,
@@ -267,6 +268,21 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
           .prepare('SELECT timestamp, kind, content FROM messages_in ORDER BY seq DESC LIMIT ?')
           .all(limit) as MailboxHistoryMessage[]
       ).map((row) => ({ ...row, timestamp: sqliteTimestamp(row.timestamp) })),
+    getInboundDeliveryState: (limit) =>
+      (
+        db
+          .prepare(
+            'SELECT id, kind, channel_type AS channelType, status, trigger, content FROM messages_in ORDER BY seq DESC LIMIT ?',
+          )
+          .all(limit) as Array<Omit<MailboxDeliveryState, 'trigger'> & { trigger: number }>
+      ).map((row) => ({ ...row, trigger: row.trigger === 1 })),
+    markPendingContextHandled: (rowIds) => {
+      if (rowIds.length === 0) return 0;
+      const stmt = db.prepare(
+        "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status = 'pending' AND trigger = 0",
+      );
+      return db.transaction(() => rowIds.reduce((n, id) => n + stmt.run(id).changes, 0))();
+    },
     getConversationRoot: () => {
       const row = db
         .prepare(
