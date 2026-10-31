@@ -70,6 +70,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     timezone: row.timezone,
     notion_broker: row.notion_broker === 1,
     slack_context_fetch: row.slack_context_fetch === 1,
+    person_memory: row.person_memory === 1,
     updated_at: row.updated_at,
   };
 }
@@ -372,7 +373,7 @@ registerResource({
       access: 'approval',
       description:
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --notion-broker (true|false; opts the agent in to the per-requester Notion MCP server), --slack-context-fetch (true|false; on a Slack mention, fetch the thread/channel history as background context; host-side, takes effect immediately), ' +
+        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --notion-broker (true|false; opts the agent in to the per-requester Notion MCP server), --slack-context-fetch (true|false; on a Slack mention, fetch the thread/channel history as background context; host-side, takes effect immediately), --person-memory (true|false; per-person memory in DM sessions, written only on the person\'s yes; takes effect at the next container start), ' +
         '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
       handler: async (args) => {
         const id = args.id as string;
@@ -393,6 +394,7 @@ registerResource({
             | 'timezone'
             | 'notion_broker'
             | 'slack_context_fetch'
+            | 'person_memory'
           >
         > = {};
         if (args.provider !== undefined) updates.provider = args.provider as string;
@@ -412,6 +414,13 @@ registerResource({
           }
           updates.slack_context_fetch = flag === 'true' || flag === '1' ? 1 : 0;
         }
+        if (args['person-memory'] !== undefined || args.person_memory !== undefined) {
+          const flag = String(args['person-memory'] ?? args.person_memory).toLowerCase();
+          if (!['true', 'false', '1', '0'].includes(flag)) {
+            throw new Error('--person-memory must be true or false');
+          }
+          updates.person_memory = flag === 'true' || flag === '1' ? 1 : 0;
+        }
         if (args.model !== undefined) updates.model = args.model as string;
         if (args.effort !== undefined) updates.effort = args.effort as string;
         if (args.image_tag !== undefined) updates.image_tag = args.image_tag as string;
@@ -428,7 +437,7 @@ registerResource({
 
         if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --notion-broker, --slack-context-fetch, --timezone',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --notion-broker, --slack-context-fetch, --person-memory, --timezone',
           );
         }
 
