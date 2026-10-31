@@ -6,6 +6,11 @@ import path from 'path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./claude-md-compose.js', () => ({ composeGroupClaudeMd: vi.fn() }));
+const sharedWiring = vi.hoisted(() => ({ value: false }));
+vi.mock('./person-memory.js', async () => {
+  const actual = await vi.importActual<typeof import('./person-memory.js')>('./person-memory.js');
+  return { ...actual, agentHasSharedWiring: vi.fn(async () => sharedWiring.value) };
+});
 vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
@@ -67,6 +72,29 @@ describe('per-session mounts', () => {
       hostPath: path.join(groupDir, 'memory'),
       readonly: true,
     });
+  });
+
+  it('mounts per-person memory read-only only for a DM requester with the flag on (decision 0026)', async () => {
+    const withFlag = { ...containerConfig, personMemory: true } as ContainerConfig;
+    const dm = { ...sess('sDM'), requester_user_id: 'slack:U1' } as Session;
+    const osobni = (ms: Awaited<ReturnType<typeof buildMounts>>) =>
+      ms.find((m) => m.containerPath === '/workspace/osobni');
+    const mounted = osobni(await buildMounts(agentGroup, dm, withFlag, 'claude', {}))!;
+    expect(mounted).toMatchObject({ readonly: true });
+    expect(mounted.hostPath.startsWith(path.join(DATA_DIR, 'v2-people', GROUP_ID) + path.sep)).toBe(true);
+    expect(fs.existsSync(path.join(mounted.hostPath, 'PAMET.md'))).toBe(true);
+    const other = osobni(
+      await buildMounts(agentGroup, { ...sess('sDM2'), requester_user_id: 'slack:U2' } as Session, withFlag, 'claude', {}),
+    )!;
+    expect(other.hostPath).not.toBe(mounted.hostPath);
+    // No requester (channel/thread/agent-shared) or flag off: no mount at all.
+    expect(osobni(await buildMounts(agentGroup, sess('sCh'), withFlag, 'claude', {}))).toBeUndefined();
+    expect(osobni(await buildMounts(agentGroup, dm, containerConfig, 'claude', {}))).toBeUndefined();
+    // An agent with an agent-shared wiring (a channel can be routed into a DM session): no mount.
+    sharedWiring.value = true;
+    expect(osobni(await buildMounts(agentGroup, dm, withFlag, 'claude', {}))).toBeUndefined();
+    sharedWiring.value = false;
+    fs.rmSync(path.join(DATA_DIR, 'v2-people', GROUP_ID), { recursive: true, force: true });
   });
 
   it('points archives at the session state, and not when no state is mounted', async () => {

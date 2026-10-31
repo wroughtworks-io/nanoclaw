@@ -13,6 +13,7 @@ const SCALAR_COLUMNS = new Set([
   'timezone',
   'notion_broker',
   'slack_context_fetch',
+  'person_memory',
 ]);
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
 
@@ -90,6 +91,7 @@ export async function updateContainerConfigScalars(
       | 'timezone'
       | 'notion_broker'
       | 'slack_context_fetch'
+      | 'person_memory'
     >
   >,
 ): Promise<void> {
