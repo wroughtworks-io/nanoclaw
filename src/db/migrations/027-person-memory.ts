@@ -9,8 +9,9 @@ import type { Migration } from './index.js';
  *
  *   person_memory_proposals — an item the agent proposed, held until the
  *     person's next message in the DM. Stored as a memory only on a plain yes
- *     (src/person-memory.ts). status: pending | approved | declined |
- *     expired | superseded.
+ *     (src/person-memory.ts), and only after the ask was delivered (asked_at).
+ *     status: pending | approved | declined | expired | superseded |
+ *     interrupted | failed | full. text is cleared once settled.
  *
  * Adds a column and a table only, so pinning the previous build is safe.
  */
@@ -29,7 +30,9 @@ export const migration027: Migration = {
         status               TEXT NOT NULL DEFAULT 'pending',
         created_at           TEXT NOT NULL,
         resolved_at          TEXT,
-        resolved_message_id  TEXT
+        resolved_message_id  TEXT,
+        ask_message_id       TEXT,
+        asked_at             TEXT
       );
     `);
     await db.exec(

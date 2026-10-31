@@ -37,7 +37,7 @@ import { GROUP_FOLDER_LABEL, labelValueLegal, specInvalid } from './drivers/type
 import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './drivers/types.js';
 import { getGatewayProvider, type GatewayContribution } from './gateway-providers/index.js';
 import { initGroupFilesystem, seedMemoryScaffold } from './group-init.js';
-import { ensurePersonDir, PERSON_MEMORY_CONTAINER_PATH } from './person-memory.js';
+import { agentHasSharedWiring, ensurePersonDir, PERSON_MEMORY_CONTAINER_PATH } from './person-memory.js';
 import { SESSION_CONVERSATIONS_DIR, sessionClaudeStateDir } from './session-claude-state.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { prepareBrokerEnv, revokeBrokerSecretOnStop, sha256Hex, type BrokerEnv } from './notion-broker.js';
@@ -654,7 +654,12 @@ export async function buildMounts(
   // Per-person memory (decision 0026): the requester's own folder, read-only,
   // into DM sessions only (requester_user_id is set for is_group=0 alone) and
   // only for an agent that opted in. The host writes it; the agent reads it.
-  if (session.requester_user_id && containerConfig.personMemory) {
+  // An agent with an agent-shared wiring is refused: a channel can be routed into a DM session.
+  if (
+    session.requester_user_id &&
+    containerConfig.personMemory &&
+    !(await agentHasSharedWiring(agentGroup.id))
+  ) {
     mounts.push({
       hostPath: ensurePersonDir(agentGroup.id, session.requester_user_id),
       containerPath: PERSON_MEMORY_CONTAINER_PATH,

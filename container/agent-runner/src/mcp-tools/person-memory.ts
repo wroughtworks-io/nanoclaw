@@ -80,4 +80,6 @@ export const zapomenout: McpToolDefinition = {
   },
 };
 
-if (fs.existsSync(MOUNT)) registerTools([zapamatovat, zapomenout]);
+// The host's mount always carries PAMET.md. The host refuses either action anyway when the
+// session is not an opted-in DM, so a look-alike folder made inside /workspace gains nothing.
+if (fs.existsSync(`${MOUNT}/PAMET.md`)) registerTools([zapamatovat, zapomenout]);

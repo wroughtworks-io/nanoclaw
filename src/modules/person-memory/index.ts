@@ -10,14 +10,14 @@
  * A proposal is only held; the store happens on the person's yes, judged by
  * host code. A forget only removes, and the host announces it to the person.
  */
-import { registerDeliveryAction } from '../../delivery.js';
+import { registerDeliveryAction, registerPostDeliveryHook } from '../../delivery.js';
 import { unguarded } from '../../guard/types.js';
-import { forgetOnRequest, MAX_ITEM_LEN, MAX_ITEMS, proposeItem } from '../../person-memory.js';
+import { forgetOnRequest, MAX_ITEM_LEN, MAX_ITEMS, onDelivered, proposeItem } from '../../person-memory.js';
 import { notifyAgent } from '../approvals/index.js';
 
 const REFUSALS: Record<string, string> = {
   not_a_dm: 'person memory exists only in a 1:1 DM with one person; nothing was proposed.',
-  disabled: 'person memory is not enabled for this agent; nothing was proposed.',
+  disabled: 'person memory is not enabled for this agent here; nothing was proposed.',
   empty: 'the proposed text was empty; nothing was proposed.',
   too_long: `the proposed text is longer than ${MAX_ITEM_LEN} characters; shorten it and propose again.`,
   full: `this person's memory holds ${MAX_ITEMS} items; ask them what to forget before proposing more.`,
@@ -46,8 +46,15 @@ registerDeliveryAction(
       return;
     }
     const removed = await forgetOnRequest(session, ids);
-    if (removed === null) await notifyAgent(session, 'zapomenout refused: person memory exists only in a 1:1 DM.');
+    if (removed === null)
+      await notifyAgent(session, 'zapomenout refused: person memory is available only in a 1:1 DM of an opted-in agent.');
     else if (removed.length === 0) await notifyAgent(session, 'zapomenout: no matching items; nothing was removed.');
   },
   unguarded("removes only from the requester's own memory in their DM session, and the host announces it to them"),
 );
+
+// The ask reaching the person arms its proposal; any later message to them voids it.
+registerPostDeliveryHook(async (msg, session) => {
+  if (!session.requester_user_id) return;
+  await onDelivered(msg.id, session);
+});

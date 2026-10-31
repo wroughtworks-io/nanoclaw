@@ -610,7 +610,10 @@ async function deliverToAgent(
   // stores the item and is consumed; anything else declines it and routes on.
   if (session.requester_user_id && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     try {
-      if (await resolvePersonMemoryReply(session, userId, inboundText(event), event.message.id)) return;
+      if (
+        await resolvePersonMemoryReply(session, userId, inboundText(event), event.message.id, event.message.timestamp)
+      )
+        return;
     } catch (err) {
       log.error('person-memory: reply resolution failed; message routed as usual', { sessionId: session.id, err });
     }

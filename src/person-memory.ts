@@ -164,6 +164,13 @@ export function erasePerson(requesterUserId: string): number {
 }
 
 // ── Proposals ──
+//
+// Consent is bound to the person having SEEN the exact text: a proposal can be
+// approved only after its ask was delivered (asked_at, set by the post-delivery
+// hook) and only while the ask is still the last thing delivered in the DM — any
+// later message to the person voids it ('interrupted'), so an "ano" can never be
+// read as approval of something above the latest question. Proposal text is
+// cleared once a proposal is settled: the only copy of an item is items.json.
 
 interface ProposalRow {
   id: string;
@@ -173,6 +180,8 @@ interface ProposalRow {
   text: string;
   status: string;
   created_at: string;
+  ask_message_id: string | null;
+  asked_at: string | null;
 }
 
 async function latestPending(sessionId: string): Promise<ProposalRow | undefined> {
@@ -183,23 +192,42 @@ async function latestPending(sessionId: string): Promise<ProposalRow | undefined
   );
 }
 
-async function resolveProposal(id: string, status: string, messageId: string | null): Promise<void> {
-  await getDb().run(
-    `UPDATE person_memory_proposals SET status = ?, resolved_at = ?, resolved_message_id = ?
+/** Settle a pending proposal. Atomic: returns false if another path settled it first. Clears the text. */
+async function settleProposal(id: string, status: string, messageId: string | null): Promise<boolean> {
+  const res = await getDb().run(
+    `UPDATE person_memory_proposals SET status = ?, text = '', resolved_at = ?, resolved_message_id = ?
        WHERE id = ? AND status = 'pending'`,
     status,
     new Date().toISOString(),
     messageId,
     id,
   );
+  return res.changes > 0;
+}
+
+/**
+ * An agent with any agent-shared wiring can have a channel routed into a DM
+ * session (agent-shared resolves to the agent's latest session, whatever its
+ * messaging group). Such an agent gets no personal memory at all.
+ */
+export async function agentHasSharedWiring(agentGroupId: string): Promise<boolean> {
+  const row = await getDb().get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM messaging_group_agents WHERE agent_group_id = ? AND session_mode = 'agent-shared'`,
+    agentGroupId,
+  );
+  return (row?.n ?? 0) > 0;
+}
+
+function newOutboundId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /** Post a host-authored line into the session's DM. */
-async function postToPerson(session: Session, text: string, idPrefix: string): Promise<void> {
+async function postToPerson(session: Session, text: string, id: string): Promise<void> {
   const mg = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
   if (!mg) throw new Error(`no messaging group for session ${session.id}`);
   await writeOutboundDirect(session.agent_group_id, session.id, {
-    id: `${idPrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id,
     kind: 'chat',
     platformId: mg.platform_id,
     channelType: mg.channel_type,
@@ -208,22 +236,32 @@ async function postToPerson(session: Session, text: string, idPrefix: string): P
   });
 }
 
+/** The session's DM check, shared by every path that touches a person's memory. */
+async function dmAllowed(session: Session): Promise<boolean> {
+  if (!session.requester_user_id) return false;
+  const mg = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
+  if (!mg || mg.is_group !== 0) return false;
+  const cfg = await getContainerConfig(session.agent_group_id);
+  if (cfg?.person_memory !== 1) return false;
+  return !(await agentHasSharedWiring(session.agent_group_id));
+}
+
 export type ProposeOutcome =
   | { ok: true; proposalId: string }
   | { ok: false; reason: 'not_a_dm' | 'disabled' | 'empty' | 'too_long' | 'full' };
 
 /**
  * Hold an agent's proposal and ask the person. Refused unless the session has
- * a requester (a DM — see dmRequesterFor), the agent has the flag, and the
- * session's messaging group is really a DM (checked again here, not trusted).
+ * a requester (a DM — see dmRequesterFor), its messaging group is really a DM
+ * (checked again here, not trusted), the agent has the flag, and the agent has
+ * no agent-shared wiring.
  */
 export async function proposeItem(session: Session, rawText: unknown): Promise<ProposeOutcome> {
   const requester = session.requester_user_id;
   if (!requester) return { ok: false, reason: 'not_a_dm' };
   const mg = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
   if (!mg || mg.is_group !== 0) return { ok: false, reason: 'not_a_dm' };
-  const cfg = await getContainerConfig(session.agent_group_id);
-  if (cfg?.person_memory !== 1) return { ok: false, reason: 'disabled' };
+  if (!(await dmAllowed(session))) return { ok: false, reason: 'disabled' };
 
   const text = typeof rawText === 'string' ? rawText.trim() : '';
   if (!text) return { ok: false, reason: 'empty' };
@@ -232,29 +270,56 @@ export async function proposeItem(session: Session, rawText: unknown): Promise<P
 
   // One pending proposal per session: a new one replaces the old.
   await getDb().run(
-    `UPDATE person_memory_proposals SET status = 'superseded', resolved_at = ?
+    `UPDATE person_memory_proposals SET status = 'superseded', text = '', resolved_at = ?
        WHERE session_id = ? AND status = 'pending'`,
     new Date().toISOString(),
     session.id,
   );
-  const id = `pmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const id = newOutboundId('pmp');
+  const askId = newOutboundId('pm-ask');
   await getDb().run(
-    `INSERT INTO person_memory_proposals (id, session_id, agent_group_id, requester_user_id, text, status, created_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+    `INSERT INTO person_memory_proposals
+       (id, session_id, agent_group_id, requester_user_id, text, status, created_at, ask_message_id)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
     id,
     session.id,
     session.agent_group_id,
     requester,
     text,
     new Date().toISOString(),
+    askId,
   );
-  await postToPerson(
-    session,
-    `Mám si zapamatovat: „${text}“?\nOdpověz *ano* — jakákoli jiná odpověď návrh zruší.`,
-    'pm-ask',
-  );
+  try {
+    await postToPerson(
+      session,
+      `Mám si zapamatovat: „${text}“?\nOdpověz *ano* — jakákoli jiná odpověď návrh zruší.`,
+      askId,
+    );
+  } catch (err) {
+    await settleProposal(id, 'failed', null);
+    throw err;
+  }
   log.info('person-memory: proposal held', { sessionId: session.id, proposalId: id });
   return { ok: true, proposalId: id };
+}
+
+/**
+ * Post-delivery hook (registered by the module): the ask reaching the person
+ * arms its proposal; anything else delivered after an armed ask voids it.
+ */
+export async function onDelivered(messageId: string, session: Session): Promise<void> {
+  const pending = await latestPending(session.id);
+  if (!pending) return;
+  if (messageId === pending.ask_message_id) {
+    await getDb().run(
+      `UPDATE person_memory_proposals SET asked_at = ? WHERE id = ? AND status = 'pending' AND asked_at IS NULL`,
+      new Date().toISOString(),
+      pending.id,
+    );
+  } else if (pending.asked_at) {
+    await settleProposal(pending.id, 'interrupted', null);
+    log.info('person-memory: proposal voided by a later message', { sessionId: session.id, proposalId: pending.id });
+  }
 }
 
 /**
@@ -262,43 +327,62 @@ export async function proposeItem(session: Session, rawText: unknown): Promise<P
  * the agent sees it. Returns true when the message was the person's yes and
  * has been consumed (stored + confirmed); false lets it route as usual.
  *
- * Only the session's own requester can resolve its proposal. Any reply other
- * than a plain yes declines it; a proposal older than PROPOSAL_TTL_MS expires.
+ * Only the session's own requester can resolve its proposal, only after its
+ * ask was delivered, and only with a message sent after that. Any other reply
+ * declines it; a proposal older than PROPOSAL_TTL_MS expires. The yes is
+ * consumed so one "ano" can never also answer a question of the agent's.
  */
 export async function resolveReply(
   session: Session,
   senderUserId: string | null,
   text: string,
   messageId: string,
+  sentAt?: string,
 ): Promise<boolean> {
   const requester = session.requester_user_id;
   if (!requester || senderUserId !== requester) return false;
   const pending = await latestPending(session.id);
   if (!pending || pending.requester_user_id !== requester) return false;
+  // Not yet seen by the person, or this message was written before it arrived: leave it pending.
+  if (!pending.asked_at) return false;
+  if (sentAt && Date.parse(sentAt) < Date.parse(pending.asked_at)) return false;
 
   if (Date.now() - Date.parse(pending.created_at) > PROPOSAL_TTL_MS) {
-    await resolveProposal(pending.id, 'expired', messageId);
+    await settleProposal(pending.id, 'expired', messageId);
     return false;
   }
   if (!isPlainYes(text)) {
-    await resolveProposal(pending.id, 'declined', messageId);
+    await settleProposal(pending.id, 'declined', messageId);
     log.info('person-memory: proposal declined', { sessionId: session.id, proposalId: pending.id });
     return false;
   }
+  if (!(await dmAllowed(session))) {
+    await settleProposal(pending.id, 'failed', messageId);
+    return false;
+  }
 
-  const stored = addItem(session.agent_group_id, requester, {
-    text: pending.text,
-    session_id: session.id,
-    proposal_id: pending.id,
-    approval_message_id: messageId,
-  });
-  if (!stored) {
-    await resolveProposal(pending.id, 'declined', messageId);
-    await postToPerson(session, 'Paměť je plná, nic se neuložilo. Řekni, co mám zapomenout.', 'pm-full');
+  // Claim first: of two quick yeses only one stores.
+  if (!(await settleProposal(pending.id, 'approved', messageId))) return true;
+  let stored: MemoryItem | null;
+  try {
+    stored = addItem(session.agent_group_id, requester, {
+      text: pending.text,
+      session_id: session.id,
+      proposal_id: pending.id,
+      approval_message_id: messageId,
+    });
+  } catch (err) {
+    await getDb().run(`UPDATE person_memory_proposals SET status = 'failed' WHERE id = ?`, pending.id);
+    log.error('person-memory: store failed after approval', { sessionId: session.id, proposalId: pending.id, err });
+    await postToPerson(session, 'Uložení se nepodařilo, nic není uloženo.', newOutboundId('pm-fail'));
     return true;
   }
-  await resolveProposal(pending.id, 'approved', messageId);
-  await postToPerson(session, `Uloženo (${stored.id}).`, 'pm-saved');
+  if (!stored) {
+    await getDb().run(`UPDATE person_memory_proposals SET status = 'full' WHERE id = ?`, pending.id);
+    await postToPerson(session, 'Paměť je plná, nic se neuložilo. Řekni, co mám zapomenout.', newOutboundId('pm-full'));
+    return true;
+  }
+  await postToPerson(session, `Uloženo (${stored.id}).`, newOutboundId('pm-saved'));
   log.info('person-memory: item stored', { sessionId: session.id, proposalId: pending.id, itemId: stored.id });
   return true;
 }
@@ -306,13 +390,18 @@ export async function resolveReply(
 /** Forget items on the agent's request, in the requester's own DM session only. Announced to the person. */
 export async function forgetOnRequest(session: Session, ids: number[] | 'all'): Promise<MemoryItem[] | null> {
   const requester = session.requester_user_id;
-  if (!requester) return null;
-  const mg = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
-  if (!mg || mg.is_group !== 0) return null;
+  if (!requester || !(await dmAllowed(session))) return null;
   const removed = forgetItems(session.agent_group_id, requester, ids);
   if (removed.length > 0) {
     const lines = removed.map((i) => `„${i.text}“`).join('\n');
-    await postToPerson(session, `Zapomenuto:\n${lines}`, 'pm-forgot');
+    await postToPerson(session, `Zapomenuto:\n${lines}`, newOutboundId('pm-forgot'));
   }
   return removed;
+}
+
+/** Operator erasure: the person's folders for every agent AND every proposal row. Returns counts. */
+export async function eraseRequester(requesterUserId: string): Promise<{ folders: number; proposals: number }> {
+  const folders = erasePerson(requesterUserId);
+  const res = await getDb().run('DELETE FROM person_memory_proposals WHERE requester_user_id = ?', requesterUserId);
+  return { folders, proposals: res.changes };
 }

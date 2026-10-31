@@ -6,6 +6,11 @@ import path from 'path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./claude-md-compose.js', () => ({ composeGroupClaudeMd: vi.fn() }));
+const sharedWiring = vi.hoisted(() => ({ value: false }));
+vi.mock('./person-memory.js', async () => {
+  const actual = await vi.importActual<typeof import('./person-memory.js')>('./person-memory.js');
+  return { ...actual, agentHasSharedWiring: vi.fn(async () => sharedWiring.value) };
+});
 vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
@@ -85,6 +90,10 @@ describe('per-session mounts', () => {
     // No requester (channel/thread/agent-shared) or flag off: no mount at all.
     expect(osobni(await buildMounts(agentGroup, sess('sCh'), withFlag, 'claude', {}))).toBeUndefined();
     expect(osobni(await buildMounts(agentGroup, dm, containerConfig, 'claude', {}))).toBeUndefined();
+    // An agent with an agent-shared wiring (a channel can be routed into a DM session): no mount.
+    sharedWiring.value = true;
+    expect(osobni(await buildMounts(agentGroup, dm, withFlag, 'claude', {}))).toBeUndefined();
+    sharedWiring.value = false;
     fs.rmSync(path.join(DATA_DIR, 'v2-people', GROUP_ID), { recursive: true, force: true });
   });
 

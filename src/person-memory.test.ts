@@ -22,8 +22,9 @@ import { routeInbound, setSenderResolver } from './router.js';
 import type { ChannelAdapter, ChannelDefaults } from './channels/adapter.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import {
-  erasePerson,
+  eraseRequester,
   forgetOnRequest,
+  onDelivered,
   isPlainYes,
   listItems,
   personDir,
@@ -145,6 +146,19 @@ function hostSaid(session: Session): string[] {
   return rows.map((r) => (JSON.parse(r.content) as { text?: string }).text ?? '');
 }
 
+/** The delivery loop reaching the person with the latest ask (the post-delivery hook). */
+async function deliverAsk(s: Session): Promise<void> {
+  const row = await getDb().get<{ ask_message_id: string }>(
+    `SELECT ask_message_id FROM person_memory_proposals WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1`,
+  );
+  await onDelivered(row!.ask_message_id, s);
+}
+
+async function propose(s: Session, text: string): Promise<void> {
+  expect(await proposeItem(s, text)).toMatchObject({ ok: true });
+  await deliverAsk(s);
+}
+
 async function proposals(): Promise<string[]> {
   const rows = await getDb().all<{ status: string }>('SELECT status FROM person_memory_proposals ORDER BY created_at');
   return rows.map((r) => r.status);
@@ -178,7 +192,7 @@ describe('per-person memory in a DM', () => {
     await seed(0);
     await say('m1', 'ahoj');
     const s = await theSession();
-    expect(await proposeItem(s, 'Preferuje stručné odpovědi.')).toMatchObject({ ok: true });
+    await propose(s, 'Preferuje stručné odpovědi.');
     expect(hostSaid(s).join('\n')).toContain('„Preferuje stručné odpovědi.“');
     expect(listItems('ag-1', A)).toEqual([]);
 
@@ -195,7 +209,7 @@ describe('per-person memory in a DM', () => {
     await seed(0);
     await say('m1', 'ahoj');
     const s = await theSession();
-    await proposeItem(s, 'Pracuje na projektu Bachrova.');
+    await propose(s, 'Pracuje na projektu Bachrova.');
     await say('m2', 'ano, ale jen do konce roku');
     expect(listItems('ag-1', A)).toEqual([]);
     expect(await proposals()).toEqual(['declined']);
@@ -206,7 +220,7 @@ describe('per-person memory in a DM', () => {
     await seed(0);
     await say('m1', 'ahoj');
     const s = await theSession();
-    await proposeItem(s, 'Něco o A.');
+    await propose(s, 'Něco o A.');
     sender = B;
     await say('m2', 'ano');
     expect(listItems('ag-1', A)).toEqual([]);
@@ -217,7 +231,7 @@ describe('per-person memory in a DM', () => {
     await seed(0);
     await say('m1', 'ahoj');
     const s = await theSession();
-    await proposeItem(s, 'Staré.');
+    await propose(s, 'Staré.');
     const old = new Date(Date.now() - PROPOSAL_TTL_MS - 1000).toISOString();
     await getDb().run('UPDATE person_memory_proposals SET created_at = ?', old);
     await say('m2', 'ano');
@@ -230,8 +244,8 @@ describe('per-person memory in a DM', () => {
     await seed(0);
     await say('m1', 'ahoj');
     const s = await theSession();
-    await proposeItem(s, 'První.');
-    await proposeItem(s, 'Druhé.');
+    await propose(s, 'První.');
+    await propose(s, 'Druhé.');
     await say('m2', 'jo');
     expect(listItems('ag-1', A).map((i) => i.text)).toEqual(['Druhé.']);
     expect((await proposals()).sort()).toEqual(['approved', 'superseded']);
@@ -250,16 +264,90 @@ describe('per-person memory in a DM', () => {
     await seed(0);
     await say('m1', 'ahoj');
     const s = await theSession();
-    await proposeItem(s, 'Jedna.');
+    await propose(s, 'Jedna.');
     await say('m2', 'ano');
-    await proposeItem(s, 'Dvě.');
+    await propose(s, 'Dvě.');
     await say('m3', 'ano');
     const removed = await forgetOnRequest(s, [1]);
     expect(removed?.map((i) => i.text)).toEqual(['Jedna.']);
     expect(listItems('ag-1', A).map((i) => i.text)).toEqual(['Dvě.']);
     expect(hostSaid(s).join('\n')).toContain('Zapomenuto:\n„Jedna.“');
-    expect(erasePerson(A)).toBe(1);
+    expect(await eraseRequester(A)).toEqual({ folders: 1, proposals: 2 });
     expect(fs.existsSync(personDir('ag-1', A))).toBe(false);
+  });
+
+  it('a yes before the ask was delivered stores nothing and leaves it pending', async () => {
+    await seed(0);
+    await say('m1', 'ahoj');
+    const s = await theSession();
+    await proposeItem(s, 'Nedoručené.');
+    await say('m2', 'ano');
+    expect(listItems('ag-1', A)).toEqual([]);
+    expect(await proposals()).toEqual(['pending']);
+    expect(agentSaw(s)).toContain('ano');
+  });
+
+  it('any message delivered after the ask voids it, so a later yes stores nothing', async () => {
+    await seed(0);
+    await say('m1', 'ahoj');
+    const s = await theSession();
+    await propose(s, 'Přerušené.');
+    await onDelivered('agent-question-after-the-ask', s);
+    await say('m2', 'ano');
+    expect(listItems('ag-1', A)).toEqual([]);
+    expect(await proposals()).toEqual(['interrupted']);
+  });
+
+  it('two quick yeses store the item once', async () => {
+    await seed(0);
+    await say('m1', 'ahoj');
+    const s = await theSession();
+    await propose(s, 'Jednou.');
+    await Promise.all([say('m2', 'ano'), say('m3', 'jo')]);
+    expect(listItems('ag-1', A).map((i) => i.text)).toEqual(['Jednou.']);
+  });
+
+  it('settled proposals keep no text', async () => {
+    await seed(0);
+    await say('m1', 'ahoj');
+    const s = await theSession();
+    await propose(s, 'Odmítnuté.');
+    await say('m2', 'ne');
+    await propose(s, 'Přijaté.');
+    await say('m3', 'ano');
+    const texts = await getDb().all<{ text: string }>('SELECT text FROM person_memory_proposals');
+    expect(texts.map((t) => t.text)).toEqual(['', '']);
+  });
+
+  it('an agent with an agent-shared wiring gets no personal memory', async () => {
+    await seed(0);
+    await say('m1', 'ahoj');
+    await createMessagingGroup({
+      id: 'mg-2',
+      channel_type: 'testchat',
+      platform_id: 'testchat:C2',
+      instance: 'testchat',
+      name: 'Kanál',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    await createMessagingGroupAgent({
+      id: 'mga-2',
+      messaging_group_id: 'mg-2',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 0,
+      threads: 1,
+      created_at: now(),
+    });
+    const s = await theSession();
+    expect(await proposeItem(s, 'Cokoli.')).toEqual({ ok: false, reason: 'disabled' });
+    expect(await forgetOnRequest(s, 'all')).toBeNull();
   });
 });
 
