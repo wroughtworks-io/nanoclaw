@@ -167,10 +167,19 @@ export function erasePerson(requesterUserId: string): number {
 //
 // Consent is bound to the person having SEEN the exact text: a proposal can be
 // approved only after its ask was delivered (asked_at, set by the post-delivery
-// hook) and only while the ask is still the last thing delivered in the DM — any
-// later message to the person voids it ('interrupted'), so an "ano" can never be
-// read as approval of something above the latest question. Proposal text is
-// cleared once a proposal is settled: the only copy of an item is items.json.
+// hook) and only while the ask is the last thing delivered in the DM. When
+// anything else reaches the person after it (typically the agent's own reply in
+// the turn that proposed), the ask is posted again so it is last; after
+// MAX_ASKS the proposal is voided ('interrupted') and the person is told. So an
+// "ano" can never be read as approval of something above the latest question.
+// Proposal text is cleared once a proposal is settled: the only copy of an item
+// is items.json.
+
+export const MAX_ASKS = 3;
+
+function askText(text: string): string {
+  return `Mám si zapamatovat: „${text}“?\nOdpověz *ano* — jakákoli jiná odpověď návrh zruší.`;
+}
 
 interface ProposalRow {
   id: string;
@@ -182,6 +191,7 @@ interface ProposalRow {
   created_at: string;
   ask_message_id: string | null;
   asked_at: string | null;
+  ask_count: number;
 }
 
 async function latestPending(sessionId: string): Promise<ProposalRow | undefined> {
@@ -290,11 +300,7 @@ export async function proposeItem(session: Session, rawText: unknown): Promise<P
     askId,
   );
   try {
-    await postToPerson(
-      session,
-      `Mám si zapamatovat: „${text}“?\nOdpověz *ano* — jakákoli jiná odpověď návrh zruší.`,
-      askId,
-    );
+    await postToPerson(session, askText(text), askId);
   } catch (err) {
     await settleProposal(id, 'failed', null);
     throw err;
@@ -305,7 +311,9 @@ export async function proposeItem(session: Session, rawText: unknown): Promise<P
 
 /**
  * Post-delivery hook (registered by the module): the ask reaching the person
- * arms its proposal; anything else delivered after an armed ask voids it.
+ * arms its proposal. Anything else delivered after an armed ask disarms it and
+ * posts the ask again so it is last; after MAX_ASKS the proposal is voided and
+ * the person is told.
  */
 export async function onDelivered(messageId: string, session: Session): Promise<void> {
   const pending = await latestPending(session.id);
@@ -316,9 +324,31 @@ export async function onDelivered(messageId: string, session: Session): Promise<
       new Date().toISOString(),
       pending.id,
     );
-  } else if (pending.asked_at) {
-    await settleProposal(pending.id, 'interrupted', null);
-    log.info('person-memory: proposal voided by a later message', { sessionId: session.id, proposalId: pending.id });
+    return;
+  }
+  if (!pending.asked_at) return; // delivered before the ask: the ask is still to come, and will be last
+  if (pending.ask_count < MAX_ASKS) {
+    const askId = newOutboundId('pm-ask');
+    const res = await getDb().run(
+      `UPDATE person_memory_proposals SET ask_message_id = ?, asked_at = NULL, ask_count = ask_count + 1
+         WHERE id = ? AND status = 'pending' AND ask_message_id = ?`,
+      askId,
+      pending.id,
+      pending.ask_message_id,
+    );
+    if (res.changes > 0) await postToPerson(session, askText(pending.text), askId);
+    return;
+  }
+  if (await settleProposal(pending.id, 'interrupted', null)) {
+    await postToPerson(
+      session,
+      `Návrh „${pending.text}“ se neuložil: otázka nezůstala poslední zprávou. Jestli chceš, řekni mi to znovu.`,
+      newOutboundId('pm-void'),
+    );
+    log.info('person-memory: proposal voided after repeated interruptions', {
+      sessionId: session.id,
+      proposalId: pending.id,
+    });
   }
 }
 

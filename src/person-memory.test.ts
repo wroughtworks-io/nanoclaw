@@ -28,6 +28,7 @@ import {
   isPlainYes,
   listItems,
   personDir,
+  MAX_ASKS,
   PROPOSAL_TTL_MS,
   proposeItem,
 } from './person-memory.js';
@@ -287,15 +288,35 @@ describe('per-person memory in a DM', () => {
     expect(agentSaw(s)).toContain('ano');
   });
 
-  it('any message delivered after the ask voids it, so a later yes stores nothing', async () => {
+  it('the agent\'s own reply after the ask re-posts the ask, and a yes then stores', async () => {
     await seed(0);
     await say('m1', 'ahoj');
     const s = await theSession();
-    await propose(s, 'Přerušené.');
-    await onDelivered('agent-question-after-the-ask', s);
+    await propose(s, 'Preferuje e-mail.');
+    await onDelivered('agent-reply-after-the-ask', s);
+    expect(hostSaid(s).filter((t) => t.includes('„Preferuje e-mail.“'))).toHaveLength(2);
+    await say('m2', 'ano'); // the re-posted ask not yet delivered: not armed
+    expect(listItems('ag-1', A)).toEqual([]);
+    await deliverAsk(s);
+    await say('m3', 'ano');
+    expect(listItems('ag-1', A).map((i) => i.text)).toEqual(['Preferuje e-mail.']);
+  });
+
+  it('after MAX_ASKS interruptions the proposal is voided and the person is told', async () => {
+    await seed(0);
+    await say('m1', 'ahoj');
+    const s = await theSession();
+    await propose(s, 'Přerušované.');
+    for (let i = 1; i < MAX_ASKS; i++) {
+      await onDelivered(`agent-${i}`, s);
+      await deliverAsk(s);
+    }
+    await onDelivered('agent-last', s);
+    expect(await proposals()).toEqual(['interrupted']);
+    expect(hostSaid(s).at(-1)).toContain('se neuložil');
     await say('m2', 'ano');
     expect(listItems('ag-1', A)).toEqual([]);
-    expect(await proposals()).toEqual(['interrupted']);
+    expect(agentSaw(s)).toContain('ano');
   });
 
   it('two quick yeses store the item once', async () => {

@@ -32,7 +32,8 @@ export const migration027: Migration = {
         resolved_at          TEXT,
         resolved_message_id  TEXT,
         ask_message_id       TEXT,
-        asked_at             TEXT
+        asked_at             TEXT,
+        ask_count            INTEGER NOT NULL DEFAULT 1
       );
     `);
     await db.exec(
