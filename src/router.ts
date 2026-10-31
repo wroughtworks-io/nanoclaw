@@ -31,6 +31,7 @@ import {
 } from './db/messaging-groups.js';
 import { findSessionForAgent, markSessionEngaged } from './db/sessions.js';
 import { backfillNewSession, fanInboundMessage } from './modules/cross-session-context/index.js';
+import { failAck, startAck } from './modules/ack/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import {
@@ -699,13 +700,34 @@ async function deliverToAgent(
       effectiveThreadId,
       mg.instance,
     );
+    // Opt-in instant acknowledgement (eyes reaction on the RAW platform
+    // message id, after a short delay, only if no reply landed first).
+    try {
+      const ackCfg = await getContainerConfig(agent.agent_group_id);
+      if (ackCfg?.instant_ack === 1) {
+        startAck({
+          sessionId: session.id,
+          channelType: event.channelType,
+          platformId: event.platformId,
+          threadId: effectiveThreadId,
+          instance: mg.instance,
+          messageId: event.message.id,
+          delayMs: ackCfg.ack_delay_ms,
+        });
+      }
+    } catch (err) {
+      log.warn('Instant ack skipped', { sessionId: session.id, err });
+    }
     const freshSession = await getSession(session.id);
     if (freshSession) {
       const woke = await wakeContainer(freshSession);
       // wakeContainer never throws — it returns false on transient spawn
       // failure (host-sweep retries). Stop the typing indicator we just
       // started so it doesn't leak; the inbound row stays pending.
-      if (!woke) stopTypingRefresh(freshSession.id);
+      if (!woke) {
+        stopTypingRefresh(freshSession.id);
+        failAck(freshSession.id);
+      }
     }
   }
 }
