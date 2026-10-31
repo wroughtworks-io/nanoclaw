@@ -43,6 +43,7 @@ import {
 } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
+import { resolveReply as resolvePersonMemoryReply } from './person-memory.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
@@ -527,6 +528,16 @@ async function evaluateEngage(
   }
 }
 
+/** The plain text of a chat inbound (`{text}` JSON content); '' when there is none. */
+function inboundText(event: InboundEvent): string {
+  try {
+    const parsed = JSON.parse(event.message.content) as Record<string, unknown>;
+    return typeof parsed.text === 'string' ? parsed.text : '';
+  } catch {
+    return '';
+  }
+}
+
 async function deliverToAgent(
   agent: MessagingGroupAgent,
   agentGroup: AgentGroup,
@@ -592,6 +603,20 @@ async function deliverToAgent(
       });
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
       return;
+    }
+  }
+
+  // Per-person memory (decision 0026): the requester's reply to a pending
+  // proposal is judged here, by code, before the agent sees it. A plain yes
+  // stores the item and is consumed; anything else declines it and routes on.
+  if (session.requester_user_id && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
+    try {
+      if (
+        await resolvePersonMemoryReply(session, userId, inboundText(event), event.message.id, event.message.timestamp)
+      )
+        return;
+    } catch (err) {
+      log.error('person-memory: reply resolution failed; message routed as usual', { sessionId: session.id, err });
     }
   }
 

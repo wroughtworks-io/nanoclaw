@@ -15,6 +15,7 @@ const SCALAR_COLUMNS = new Set([
   'slack_context_fetch',
   'instant_ack',
   'ack_delay_ms',
+  'person_memory',
 ]);
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
 
@@ -94,6 +95,7 @@ export async function updateContainerConfigScalars(
       | 'slack_context_fetch'
       | 'instant_ack'
       | 'ack_delay_ms'
+      | 'person_memory'
     >
   >,
 ): Promise<void> {

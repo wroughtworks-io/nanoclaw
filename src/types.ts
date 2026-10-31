@@ -41,6 +41,8 @@ export interface ContainerConfigRow {
   instant_ack?: number;
   /** Per-agent override of the ack delay in ms; null/absent = module default (migration 027). */
   ack_delay_ms?: number | null;
+  /** 1 = agent opts in to per-person memory in DM sessions (migration 028, decision 0026). */
+  person_memory?: number;
   updated_at: string;
 }
 

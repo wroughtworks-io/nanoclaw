@@ -252,6 +252,8 @@ export interface ContainerConfig {
   timezone?: string;
   /** Per-agent opt-in to the per-requester Notion broker MCP server (host-decided; DB `notion_broker`). */
   notionBroker?: boolean;
+  /** Per-agent opt-in to per-person memory, mounted into DM sessions only (host-decided; DB `person_memory`). */
+  personMemory?: boolean;
   /** Session isolation tier for the group's containers; absent = the composer's default ('container'). */
   runtimeTier?: 'container' | 'vm';
 }
@@ -350,6 +352,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
     runtimeTier: parseRuntimeTier(row.runtime_tier, group.name),
     ...(row.notion_broker === 1 ? { notionBroker: true } : {}),
+    ...(row.person_memory === 1 ? { personMemory: true } : {}),
   };
 }
 
