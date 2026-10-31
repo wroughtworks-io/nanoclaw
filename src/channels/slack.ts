@@ -18,7 +18,14 @@ import { createSlackAdapter, type SlackAdapter } from '@chat-adapter/slack';
 
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
-import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults } from './adapter.js';
+import type {
+  ChannelAdapter,
+  ChannelContextDefaults,
+  ChannelDefaults,
+  ConversationContext,
+  ConversationContextMessage,
+  ConversationContextRequest,
+} from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
@@ -142,6 +149,88 @@ export async function clearSlackStatus(slackAdapter: SlackAdapter, threadId: str
   }
 }
 
+/** Max messages requested per fetch; the host trims further to its token budget. */
+export const SLACK_THREAD_FETCH_LIMIT = 50;
+export const SLACK_CHANNEL_FETCH_LIMIT = 30;
+export const SLACK_CHANNEL_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+interface SdkMessage {
+  id: string;
+  text: string;
+  author: { userId?: string; fullName?: string; userName?: string; isMe?: boolean };
+  metadata: { dateSent: Date };
+  attachments?: Array<{ name?: string }>;
+}
+
+/**
+ * Fetch Slack history around the engaging message by reusing the Chat SDK
+ * adapter's own fetchers (fetchMessages = conversations.replies,
+ * fetchChannelMessages = conversations.history). The SDK resolves author
+ * display names (users.info, cached in its state store) and flags the bot's
+ * own messages (author.isMe), so no Slack calls are made directly here.
+ *
+ * - A message whose thread ts differs from its own ts is a thread reply:
+ *   returns the thread — the newest SLACK_THREAD_FETCH_LIMIT replies before
+ *   the engaging message, plus the root when it is not among them.
+ * - Otherwise (top-level mention): the channel's recent top-level messages,
+ *   at most SLACK_CHANNEL_FETCH_LIMIT and no older than 24 h.
+ *
+ * Limitation inherited from the SDK: for threads beyond ~200 replies the
+ * newest-first window is taken from the OLDEST 200 (conversations.replies
+ * cannot page from the end), so a huge thread may miss its latest replies.
+ *
+ * Rejects on any Slack error (missing_scope, not_in_channel, ...); callers fail soft.
+ */
+export async function fetchSlackConversationContext(
+  slackAdapter: Pick<SlackAdapter, 'fetchMessages' | 'fetchChannelMessages' | 'decodeThreadId'>,
+  req: ConversationContextRequest,
+): Promise<ConversationContext> {
+  const channel = req.platformId.replace(/^slack:/, '').split(':')[0];
+  const threadTs = req.threadId ? slackAdapter.decodeThreadId(req.threadId).threadTs : '';
+  const toContext = (m: SdkMessage): ConversationContextMessage => {
+    const files = (m.attachments ?? []).map((a) => a.name).filter(Boolean);
+    const text = [m.text, files.length ? `[attachments: ${files.join(', ')}]` : ''].filter(Boolean).join(' ');
+    return {
+      id: m.id,
+      sender: m.author.fullName || m.author.userName || m.author.userId || 'unknown',
+      senderId: m.author.userId,
+      isSelf: m.author.isMe === true,
+      text,
+      timestamp: m.metadata.dateSent.toISOString(),
+    };
+  };
+  const keep = (m: ConversationContextMessage): boolean => m.id !== req.messageId && m.text.trim().length > 0;
+
+  if (req.threadId && threadTs && threadTs !== req.messageId) {
+    const recent = await slackAdapter.fetchMessages(req.threadId, {
+      direction: 'backward',
+      limit: SLACK_THREAD_FETCH_LIMIT,
+      cursor: req.messageId, // `latest`, exclusive: only messages before the engaging one
+    });
+    const messages = (recent.messages as SdkMessage[]).map(toContext);
+    if (messages[0]?.id !== threadTs) {
+      // The root fell outside the newest-N window — fetch it alone.
+      const first = await slackAdapter.fetchMessages(req.threadId, { direction: 'forward', limit: 1 });
+      const root = (first.messages as SdkMessage[])[0];
+      if (root && root.id === threadTs) messages.unshift(toContext(root));
+    }
+    return { source: 'thread', messages: messages.filter(keep) };
+  }
+
+  const triggerMs = Number(req.messageId) * 1000;
+  const anchor = Number.isFinite(triggerMs) && triggerMs > 0 ? triggerMs : Date.now();
+  const history = await slackAdapter.fetchChannelMessages(`slack:${channel}`, {
+    direction: 'backward',
+    limit: SLACK_CHANNEL_FETCH_LIMIT,
+    cursor: req.messageId,
+  });
+  const messages = (history.messages as SdkMessage[])
+    .map(toContext)
+    .filter((m) => Date.parse(m.timestamp) >= anchor - SLACK_CHANNEL_WINDOW_MS)
+    .filter(keep);
+  return { source: 'channel', messages };
+}
+
 /** Construction knobs for one Slack bot identity. */
 export interface SlackBridgeOptions {
   /**
@@ -211,6 +300,7 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
   // rides on the returned object until the core seam lands.
   return Object.assign(bridge, {
     resolveConversation: (platformId: string) => resolveSlackConversation(slackAdapter, platformId),
+    fetchConversationContext: (req: ConversationContextRequest) => fetchSlackConversationContext(slackAdapter, req),
   });
 }
 

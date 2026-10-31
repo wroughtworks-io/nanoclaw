@@ -20,6 +20,8 @@
 import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
 import { gateCommand } from './command-gate.js';
+import { injectConversationContext } from './conversation-context.js';
+import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
@@ -598,6 +600,30 @@ async function deliverToAgent(
     // sessions BEFORE the triggering message is written, so replying to
     // something said in another thread lands with that context in view.
     await backfillNewSession(agentGroup, session, mg);
+  }
+
+  // Opt-in (container_configs.slack_context_fetch, default off): a MENTION that
+  // wakes the agent in a channel/thread pulls the surrounding history from the
+  // platform as one background row, written BEFORE the waking message. Fails
+  // soft — see src/conversation-context.ts.
+  if (wake && event.message.isMention === true && mg.is_group !== 0) {
+    try {
+      const cfg = await getContainerConfig(agent.agent_group_id);
+      if (cfg?.slack_context_fetch === 1) {
+        await injectConversationContext({
+          adapter: getChannelAdapter(mg.instance ?? event.instance ?? event.channelType),
+          agentGroupId: session.agent_group_id,
+          sessionId: session.id,
+          platformId: event.platformId,
+          threadId: effectiveThreadId,
+          messageId: event.message.id,
+          messageTimestamp: event.message.timestamp,
+          channelType: deliveryAddr.channelType,
+        });
+      }
+    } catch (err) {
+      log.warn('Conversation context skipped', { sessionId: session.id, err });
+    }
   }
 
   const messageId = messageIdForAgent(event.message.id, agent.agent_group_id);
