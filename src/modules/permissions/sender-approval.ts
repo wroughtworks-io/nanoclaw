@@ -41,6 +41,7 @@ import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import {
   clearDeclineStamp,
   createPendingSenderApproval,
+  deletePendingSenderApproval,
   getDeclineStampAt,
   hasInFlightSenderApproval,
   upsertDeclineStamp,
@@ -153,6 +154,8 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
         question,
         options,
       }),
+      undefined,
+      target.messagingGroup.instance,
     );
     log.info('Unknown-sender approval card delivered', {
       approvalId,
@@ -166,6 +169,9 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       approvalId,
       err,
     });
+    // Same reasoning as the channel card: an undelivered row would hold the
+    // dedupe gate shut for this sender with no card anyone can answer.
+    await deletePendingSenderApproval(approvalId);
   }
 }
 
@@ -299,6 +305,8 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
       null,
       'chat-sdk',
       JSON.stringify({ text: fyiText }),
+      undefined,
+      target.messagingGroup.instance,
     );
     log.info('decline_notify handled — decline sent, owner notified', {
       messagingGroupId,
