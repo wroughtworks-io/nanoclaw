@@ -24,6 +24,7 @@ import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
+import { resolveAck, setAckAdapter } from './modules/ack/index.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
@@ -71,6 +72,15 @@ export interface ChannelDeliveryAdapter {
     status?: string,
     statusKind?: 'auto' | 'agent',
   ): Promise<void>;
+  react?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    instance: string | undefined,
+    messageId: string,
+    emoji: string,
+    remove?: boolean,
+  ): Promise<void>;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
@@ -109,6 +119,7 @@ export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
   // Forward to the typing module so it can fire setTyping on its own
   // interval. Direct call, not a registry — typing is a default module.
   setTypingAdapter(adapter);
+  setAckAdapter(adapter);
   for (const cb of adapterReadyCallbacks) {
     void Promise.resolve()
       .then(() => cb(adapter))
@@ -173,6 +184,18 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
   }
 }
 
+/**
+ * A model-issued reaction (operation: 'reaction') is not a reply: it must not
+ * clear the instant-ack eyes.
+ */
+function isReactionOnly(content: string): boolean {
+  try {
+    return (JSON.parse(content) as { operation?: unknown })?.operation === 'reaction';
+  } catch {
+    return false;
+  }
+}
+
 async function drainSession(session: Session): Promise<void> {
   const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return;
@@ -226,6 +249,7 @@ async function drainSession(session: Session): Promise<void> {
       deliveryAttempts.delete(msg.id);
       if (msg.kind !== 'system' && msg.channelType !== 'agent') {
         pauseTypingRefreshAfterDelivery(session.id);
+        if (!isReactionOnly(msg.content)) resolveAck(session.id);
         if (msg.kind !== 'task_log') {
           await fanOutboundMessage(
             {

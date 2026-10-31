@@ -124,6 +124,19 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       const adapter = getChannelAdapterExact(instance ?? channelType);
       await adapter?.setTyping?.(platformId, threadId, status, statusKind);
     },
+    async react(
+      channelType: string,
+      platformId: string,
+      threadId: string | null,
+      instance: string | undefined,
+      messageId: string,
+      emoji: string,
+      remove?: boolean,
+    ): Promise<void> {
+      const adapter = getChannelAdapterExact(instance ?? channelType);
+      if (!adapter?.react) throw new Error(`channel ${instance ?? channelType} does not support reactions`);
+      await adapter.react(platformId, threadId, messageId, emoji, remove);
+    },
   };
 }
 
