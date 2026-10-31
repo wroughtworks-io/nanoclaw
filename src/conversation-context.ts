@@ -11,15 +11,18 @@
  * Everything here fails soft: any error, timeout or empty result leaves the
  * delivery exactly as it was without the feature. Never throws.
  *
- * Dedupe: "already seen" means ACTUALLY DELIVERED to the agent in an earlier
- * turn (rows completed/processing, plus contextIds of earlier context rows),
- * matched by platform message id. Pending accumulated rows have not reached
- * the agent: the context block covers them, and once the block row is durable
- * those pending rows are retired host-side (status 'completed', conditional on
- * still-pending trigger=0) so they are not delivered twice and do not consume
- * the container's per-prompt row cap. The container's poll only reads
- * status='pending', so no container change is needed. A failed fetch marks
- * nothing and leaves exactly the pre-feature behaviour.
+ * No cross-turn dedupe: every injection renders the FULL fetched thread (or channel window)
+ * within the budget, minus only the waking message itself. Session memory is not reliable
+ * (host restarts, transcript rotation, /clear), so "delivered earlier" never implies "remembered".
+ *
+ * Within ONE prompt nothing is delivered twice: pending trigger=0 rows that the block carries
+ * (accumulated untagged messages, and an earlier still-undelivered context block it supersedes)
+ * are retired host-side once the block row is durable (status 'completed', conditional on
+ * still-pending trigger=0). Pending rows the block does NOT carry (budget-omitted, the oldest)
+ * are left pending and delivered as ordinary rows: they hold real content the block lacks, so
+ * dropping them would lose information; the omitted-marker already tells the agent older
+ * messages exist. The container's poll only reads status='pending', so no container change is
+ * needed. A failed fetch marks nothing and leaves exactly the pre-feature behaviour.
  */
 import type {
   ChannelAdapter,
@@ -37,8 +40,8 @@ export const CONTEXT_MAX_TOKENS = 8000;
 /** Per-message cap so one giant paste cannot consume the whole budget. */
 export const CONTEXT_MAX_MESSAGE_CHARS = 2000;
 export const CONTEXT_FETCH_TIMEOUT_MS = 3000;
-/** How far back into the session's mailbox to look for already-delivered ids. */
-const DEDUPE_HISTORY_ROWS = 300;
+/** How far back into the session's mailbox to look for pending rows the block may absorb. */
+const PENDING_SCAN_ROWS = 300;
 
 export const estimateTokens = (s: string): number => Math.ceil(s.length / 4);
 
@@ -115,61 +118,48 @@ export function renderContextBlock(
   return { text, kept };
 }
 
-interface MailboxIdState {
-  /** Platform message ids the agent has (or will, unconditionally) receive without our help. */
-  seen: Set<string>;
-  /** Pending accumulated rows the context block may absorb: platform message id -> mailbox row ids. */
+interface PendingState {
+  /** Pending accumulated rows the block may absorb: platform message id -> mailbox row ids. */
   coverable: Map<string, string[]>;
+  /** Earlier context-block rows still pending: the new full block supersedes them. */
+  staleContextRows: string[];
 }
 
 /** Row channel types that carry copies of other sessions' traffic, not this thread's own messages. */
 const NON_OWN_CHANNEL_TYPES = new Set(['session-echo', 'agent']);
+/** Mailbox row-id marker of context-block rows (see the write below). */
+const CONTEXT_ROW_ID_MARKER = ':slack-context:';
 
 /**
- * Classify this session's inbound rows by what the agent has actually been given.
- *
- * "Seen" = delivered in an earlier turn: status completed/processing (the container claimed it),
- * plus the contextIds of earlier context rows that were delivered or are queued to be. A PENDING
- * trigger=0 accumulated row has NOT reached the agent and is not seen — it is "coverable" instead
- * (the context block absorbs it and the row is retired afterwards). Pending rows we must not
- * absorb (waking rows, echo/agent copies, earlier context rows) will be delivered on their own,
- * so their ids count as seen to avoid duplicating them. failed/cancelled rows were never
- * delivered and are not seen.
+ * Find this session's PENDING trigger=0 rows the new block can absorb. Waking rows, echo/agent
+ * copies and non-chat rows are never absorbed; non-pending rows are irrelevant (no dedupe).
  */
-async function classifyMailboxIds(agentGroupId: string, sessionId: string): Promise<MailboxIdState> {
-  const seen = new Set<string>();
+async function findPendingAbsorbable(agentGroupId: string, sessionId: string): Promise<PendingState> {
   const coverable = new Map<string, string[]>();
+  const staleContextRows: string[] = [];
   const rows = await withExistingMailboxSession(agentGroupId, sessionId, (mb) =>
-    mb.getInboundDeliveryState(DEDUPE_HISTORY_ROWS),
+    mb.getInboundDeliveryState(PENDING_SCAN_ROWS),
   );
   for (const row of rows ?? []) {
-    if (row.status === 'failed' || row.status === 'cancelled') continue;
-    let c: { id?: unknown; contextIds?: unknown };
+    if (row.status !== 'pending' || row.trigger) continue;
+    if (row.id.includes(CONTEXT_ROW_ID_MARKER)) {
+      staleContextRows.push(row.id);
+      continue;
+    }
+    if (row.kind !== 'chat' && row.kind !== 'chat-sdk') continue;
+    if (NON_OWN_CHANNEL_TYPES.has(row.channelType ?? '')) continue;
+    let c: { id?: unknown };
     try {
-      c = JSON.parse(row.content) as { id?: unknown; contextIds?: unknown };
+      c = JSON.parse(row.content) as { id?: unknown };
     } catch {
-      continue; // non-JSON content (system rows) carries no platform id
+      continue; // non-JSON content carries no platform id
     }
-    if (c === null || typeof c !== 'object') continue;
-    const isContextRow = Array.isArray(c.contextIds);
-    // A previous context block's messages count as delivered (or queued for delivery) too.
-    if (isContextRow) for (const id of c.contextIds as unknown[]) if (typeof id === 'string') seen.add(id);
-    if (typeof c.id !== 'string' || !c.id) continue;
-    const absorbable =
-      row.status === 'pending' &&
-      !row.trigger &&
-      !isContextRow &&
-      (row.kind === 'chat' || row.kind === 'chat-sdk') &&
-      !NON_OWN_CHANNEL_TYPES.has(row.channelType ?? '');
-    if (absorbable) {
-      const list = coverable.get(c.id) ?? [];
-      list.push(row.id);
-      coverable.set(c.id, list);
-    } else {
-      seen.add(c.id);
-    }
+    if (c === null || typeof c !== 'object' || typeof c.id !== 'string' || !c.id) continue;
+    const list = coverable.get(c.id) ?? [];
+    list.push(row.id);
+    coverable.set(c.id, list);
   }
-  return { seen, coverable };
+  return { coverable, staleContextRows };
 }
 
 function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
@@ -197,7 +187,7 @@ export interface InjectContextParams {
 }
 
 /**
- * Fetch, dedupe, trim and write the background row. Call BEFORE the waking
+ * Fetch, trim and write the background row. Call BEFORE the waking
  * message is written (so it gets a lower seq and renders first). Returns true
  * when a row was written. Never throws.
  */
@@ -228,25 +218,34 @@ export async function injectConversationContext(p: InjectContextParams): Promise
       return false;
     }
 
-    const { seen, coverable } = await classifyMailboxIds(p.agentGroupId, p.sessionId);
-    const fresh = ctx.messages.filter((m) => m.id !== p.messageId && !seen.has(m.id));
-    if (fresh.length === 0) {
-      log.info('Conversation context skipped: nothing new to add (every fetched message was already delivered)', {
+    const messages = ctx.messages.filter((m) => m.id !== p.messageId);
+    if (messages.length === 0) {
+      log.info('Conversation context skipped: nothing to add (no messages besides the waking one)', {
         ...where,
         source: ctx.source,
         fetched: ctx.messages.length,
       });
       return false;
     }
-    const rendered = renderContextBlock(ctx.source, fresh, p.budget);
+    const rendered = renderContextBlock(ctx.source, messages, p.budget);
     if (!rendered) {
       log.info('Conversation context skipped: rendered block was empty', {
         ...where,
         source: ctx.source,
         fetched: ctx.messages.length,
-        fresh: fresh.length,
       });
       return false;
+    }
+
+    // Snapshot the pending rows BEFORE writing the block, so the block's own row is never in the set.
+    let pending: PendingState | null = null;
+    try {
+      pending = await findPendingAbsorbable(p.agentGroupId, p.sessionId);
+    } catch (err) {
+      log.warn('Conversation context: could not scan pending rows — they will also be delivered', {
+        ...where,
+        err: err instanceof Error ? err.message : String(err),
+      });
     }
 
     const ts = new Date(Date.parse(p.messageTimestamp) - 1);
@@ -260,7 +259,6 @@ export async function injectConversationContext(p: InjectContextParams): Promise
       content: JSON.stringify({
         text: rendered.text,
         sender: 'Slack history',
-        contextIds: rendered.kept.map((m) => m.id),
       }),
       trigger: false,
     });
@@ -269,28 +267,32 @@ export async function injectConversationContext(p: InjectContextParams): Promise
     // time (and do not eat the container's per-prompt row cap). Strictly AFTER the context row is
     // durable: a crash in between duplicates, never loses. Best-effort: a failure here leaves
     // today's behaviour (duplicates), never an error.
-    const coveredRowIds = rendered.kept.flatMap((m) => coverable.get(m.id) ?? []);
     let covered = 0;
-    if (coveredRowIds.length > 0) {
-      try {
-        covered =
-          (await withExistingMailboxSession(p.agentGroupId, p.sessionId, (mb) =>
-            mb.markPendingContextHandled(coveredRowIds),
-          )) ?? 0;
-      } catch (err) {
-        log.warn('Conversation context: could not retire covered pending rows — they will also be delivered', {
-          ...where,
-          err: err instanceof Error ? err.message : String(err),
-        });
+    if (pending) {
+      const coveredRowIds = [
+        ...rendered.kept.flatMap((m) => pending.coverable.get(m.id) ?? []),
+        ...pending.staleContextRows,
+      ];
+      if (coveredRowIds.length > 0) {
+        try {
+          covered =
+            (await withExistingMailboxSession(p.agentGroupId, p.sessionId, (mb) =>
+              mb.markPendingContextHandled(coveredRowIds),
+            )) ?? 0;
+        } catch (err) {
+          log.warn('Conversation context: could not retire covered pending rows — they will also be delivered', {
+            ...where,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
     }
     log.info('Conversation context injected', {
       ...where,
       source: ctx.source,
       fetched: ctx.messages.length,
-      fresh: fresh.length,
       kept: rendered.kept.length,
-      omitted: fresh.length - rendered.kept.length,
+      omitted: messages.length - rendered.kept.length,
       pendingRowsCovered: covered,
     });
     return true;
