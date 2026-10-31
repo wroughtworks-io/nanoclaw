@@ -9,6 +9,7 @@ import { CENTRAL_DB_PATH } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { adoptRunningSessions } from './container-runner.js';
 import { closeDb, initDb } from './db/connection.js';
+import { sweepPersistedAcks } from './modules/ack/index.js';
 import { runMigrations } from './db/migrations/index.js';
 import { getSessionDriver } from './drivers/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
@@ -148,6 +149,8 @@ async function main(): Promise<void> {
   // offline adapter is never rerouted through a sibling bot. See
   // createChannelDeliveryAdapter in channels/channel-registry.ts.
   setDeliveryAdapter(createChannelDeliveryAdapter());
+  // Clear eyes reactions a previous host process left on user messages.
+  void sweepPersistedAcks().catch((err) => log.warn('Ack startup sweep failed', { err }));
 
   // 5. Start registered host modules. Imports only registered callbacks; the
   // actual work begins here, after DB + delivery are ready and before polls.

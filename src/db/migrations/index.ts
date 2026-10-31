@@ -27,7 +27,8 @@ import { migration023 } from './023-approvals-instance.js';
 import { migration024 } from './024-session-requester-broker.js';
 import { migration025 } from './025-session-engaged-at.js';
 import { migration026 } from './026-slack-context-fetch.js';
-import { migration027 } from './027-person-memory.js';
+import { migration027 } from './027-instant-ack.js';
+import { migration028 } from './028-person-memory.js';
 
 interface MigrationBase {
   version: number;
@@ -97,6 +98,7 @@ export const migrations: Migration[] = [
   migration025,
   migration026,
   migration027,
+  migration028,
 ];
 
 /**

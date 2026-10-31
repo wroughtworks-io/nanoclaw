@@ -41,6 +41,7 @@ import { agentHasSharedWiring, ensurePersonDir, PERSON_MEMORY_CONTAINER_PATH } f
 import { SESSION_CONVERSATIONS_DIR, sessionClaudeStateDir } from './session-claude-state.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { prepareBrokerEnv, revokeBrokerSecretOnStop, sha256Hex, type BrokerEnv } from './notion-broker.js';
+import { failAck } from './modules/ack/index.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
@@ -342,6 +343,9 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
   } catch (err) {
     log.error('Failed to stop typing refresh', { sessionId, containerName, err });
   }
+  // Exit with no user-facing reply delivered: eyes -> warning. A reply that
+  // is still in the outbox clears the warning when it is delivered.
+  failAck(sessionId);
 
   if (failure && failure.kind !== 'started-then-died') {
     log.error('Session failed', { sessionId, containerName, kind: failure.kind, retryable: failure.retryable });

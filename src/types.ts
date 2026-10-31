@@ -37,7 +37,11 @@ export interface ContainerConfigRow {
   notion_broker?: number;
   /** 1 = agent opts in to fetching Slack thread/channel history on a mention (migration 026). */
   slack_context_fetch?: number;
-  /** 1 = agent opts in to per-person memory in DM sessions (migration 027, decision 0026). */
+  /** 1 = agent opts in to the instant acknowledgement reaction (migration 027). */
+  instant_ack?: number;
+  /** Per-agent override of the ack delay in ms; null/absent = module default (migration 027). */
+  ack_delay_ms?: number | null;
+  /** 1 = agent opts in to per-person memory in DM sessions (migration 028, decision 0026). */
   person_memory?: number;
   updated_at: string;
 }

@@ -70,6 +70,8 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     timezone: row.timezone,
     notion_broker: row.notion_broker === 1,
     slack_context_fetch: row.slack_context_fetch === 1,
+    instant_ack: row.instant_ack === 1,
+    ack_delay_ms: row.ack_delay_ms ?? null,
     person_memory: row.person_memory === 1,
     updated_at: row.updated_at,
   };
@@ -373,7 +375,7 @@ registerResource({
       access: 'approval',
       description:
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --notion-broker (true|false; opts the agent in to the per-requester Notion MCP server), --slack-context-fetch (true|false; on a Slack mention, fetch the thread/channel history as background context; host-side, takes effect immediately), --person-memory (true|false; per-person memory in DM sessions, written only on the person\'s yes; takes effect at the next container start), ' +
+        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --notion-broker (true|false; opts the agent in to the per-requester Notion MCP server), --slack-context-fetch (true|false; on a Slack mention, fetch the thread/channel history as background context; host-side, takes effect immediately), --instant-ack (true|false; react with eyes on the message that woke the agent if no reply lands within the delay), --ack-delay-ms (0-60000 or "default"; delay before the eyes reaction, default 3000), --person-memory (true|false; per-person memory in DM sessions, written only on the person\'s yes; takes effect at the next container start), ' +
         '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
       handler: async (args) => {
         const id = args.id as string;
@@ -394,6 +396,8 @@ registerResource({
             | 'timezone'
             | 'notion_broker'
             | 'slack_context_fetch'
+            | 'instant_ack'
+            | 'ack_delay_ms'
             | 'person_memory'
           >
         > = {};
@@ -421,6 +425,25 @@ registerResource({
           }
           updates.person_memory = flag === 'true' || flag === '1' ? 1 : 0;
         }
+        if (args['instant-ack'] !== undefined || args.instant_ack !== undefined) {
+          const flag = String(args['instant-ack'] ?? args.instant_ack).toLowerCase();
+          if (!['true', 'false', '1', '0'].includes(flag)) {
+            throw new Error('--instant-ack must be true or false');
+          }
+          updates.instant_ack = flag === 'true' || flag === '1' ? 1 : 0;
+        }
+        if (args['ack-delay-ms'] !== undefined || args.ack_delay_ms !== undefined) {
+          const raw = String(args['ack-delay-ms'] ?? args.ack_delay_ms).toLowerCase();
+          if (raw === 'default' || raw === 'null') {
+            updates.ack_delay_ms = null;
+          } else {
+            const ms = Number(raw);
+            if (!Number.isInteger(ms) || ms < 0 || ms > 60000) {
+              throw new Error('--ack-delay-ms must be an integer 0-60000 (or "default")');
+            }
+            updates.ack_delay_ms = ms;
+          }
+        }
         if (args.model !== undefined) updates.model = args.model as string;
         if (args.effort !== undefined) updates.effort = args.effort as string;
         if (args.image_tag !== undefined) updates.image_tag = args.image_tag as string;
@@ -437,7 +460,7 @@ registerResource({
 
         if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --notion-broker, --slack-context-fetch, --person-memory, --timezone',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --notion-broker, --slack-context-fetch, --instant-ack, --ack-delay-ms, --person-memory, --timezone',
           );
         }
 

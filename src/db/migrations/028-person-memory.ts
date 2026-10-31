@@ -15,8 +15,8 @@ import type { Migration } from './index.js';
  *
  * Adds a column and a table only, so pinning the previous build is safe.
  */
-export const migration027: Migration = {
-  version: 27,
+export const migration028: Migration = {
+  version: 28,
   name: 'person-memory',
   async up(db) {
     await db.exec(`ALTER TABLE container_configs ADD COLUMN person_memory INTEGER NOT NULL DEFAULT 0;`);
