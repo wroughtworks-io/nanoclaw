@@ -81,6 +81,8 @@ export interface ChannelDeliveryAdapter {
     emoji: string,
     remove?: boolean,
   ): Promise<void>;
+  /** Whether the channel resolved for `instance ?? channelType` can take reactions. */
+  canReact?(channelType: string, instance: string | undefined): boolean;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;

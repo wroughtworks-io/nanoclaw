@@ -137,6 +137,9 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       if (!adapter?.react) throw new Error(`channel ${instance ?? channelType} does not support reactions`);
       await adapter.react(platformId, threadId, messageId, emoji, remove);
     },
+    canReact(channelType: string, instance: string | undefined): boolean {
+      return typeof getChannelAdapterExact(instance ?? channelType)?.react === 'function';
+    },
   };
 }
 
