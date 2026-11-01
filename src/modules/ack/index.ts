@@ -65,6 +65,8 @@ export interface AckAdapter {
     emoji: string,
     remove?: boolean,
   ): Promise<void>;
+  /** False when the resolved channel has no reactions; absent = assume it can. */
+  canReact?(channelType: string, instance: string | undefined): boolean;
 }
 
 export interface StartAckParams {
@@ -306,6 +308,8 @@ export function startAck(params: StartAckParams): void {
   try {
     const { sessionId, messageId } = params;
     if (!messageId) return;
+    // Channels without reactions (cli, gate traffic) get no ack at all — no 👀, no ⚠️, no warning.
+    if (adapter?.canReact && !adapter.canReact(params.channelType, params.instance)) return;
     let s = sessions.get(sessionId);
     if (s?.acks.has(messageId)) return;
     if (!s) {

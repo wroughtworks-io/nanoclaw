@@ -195,6 +195,14 @@ describe('instant ack', () => {
       expect(await pending()).toBe(0);
     });
 
+    it('a channel that cannot react gets no ack and no reaction call', async () => {
+      setAckAdapter({ react: react as never, canReact: () => false });
+      startAck({ ...base, messageId: 'm1' });
+      await vi.advanceTimersByTimeAsync(DEFAULT_ACK_DELAY_MS);
+      expect(react).not.toHaveBeenCalled();
+      expect(await pending()).toBe(0);
+    });
+
     it('an adapter without react support is tolerated', async () => {
       setAckAdapter({});
       startAck({ ...base, messageId: 'm1' });
