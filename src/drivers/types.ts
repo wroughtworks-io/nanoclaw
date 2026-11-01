@@ -616,6 +616,9 @@ function mountAllowed(mount: MountSpec, spec: SessionSpec, policy: MountPolicy):
     case 'group-state': {
       if (mount.groupScope !== spec.key.agentGroupId) return false;
       if (underRoot(mount.hostPath, `${policy.dataRoot}/v2-sessions/${mount.groupScope}`)) return true;
+      // Per-person memory (person-memory.ts) lives per agent group, so the same
+      // group pin applies: a session may mount only its own group's people.
+      if (underRoot(mount.hostPath, `${policy.dataRoot}/v2-people/${mount.groupScope}`)) return true;
       if (underRoot(mount.hostPath, policy.groupsRoot)) {
         // The groups root holds EVERY group's folder, so "under groupsRoot"
         // alone would grant a session any group's state — `groupScope` cannot

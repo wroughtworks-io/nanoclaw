@@ -151,6 +151,26 @@ describe('conformance: spec realization fidelity', () => {
     ]);
   });
 
+  eachDriver("admits the group's own person-memory folder, read-only", async (h) => {
+    // A staging DM failed with denied-by-policy: buildMounts added this mount
+    // and its tests never ran it through the driver policy.
+    const spec = fixtureSpec();
+    spec.containers[0].mounts.push({
+      class: 'group-state',
+      hostPath: '/install/data/v2-people/g1/0123456789abcdef',
+      containerPath: '/workspace/osobni',
+      mode: 'ro',
+      groupScope: 'g1',
+    });
+    const realized = await h.realize(spec);
+    const agent = realized.containers.find((c) => c.role === 'agent')!;
+    expect(agent.mounts).toContainEqual({
+      hostPath: '/install/data/v2-people/g1/0123456789abcdef',
+      containerPath: '/workspace/osobni',
+      ro: true,
+    });
+  });
+
   eachDriver('never places identity material in the agent container', async (h) => {
     const realized = await h.realize(fixtureSpec());
     const agent = realized.containers.find((c) => c.role === 'agent')!;
@@ -210,6 +230,17 @@ describe('conformance: mount and env policy', () => {
           hostPath: '/install/data/v2-sessions/g2/s2',
           containerPath: '/workspace/other',
           mode: 'rw',
+          groupScope: 'g1',
+        }),
+    ],
+    [
+      'person memory belonging to another group',
+      (spec) =>
+        spec.containers[0].mounts.push({
+          class: 'group-state',
+          hostPath: '/install/data/v2-people/g2/0123456789abcdef',
+          containerPath: '/workspace/osobni',
+          mode: 'ro',
           groupScope: 'g1',
         }),
     ],
