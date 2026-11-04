@@ -480,6 +480,48 @@ describe('router', () => {
     expect(await getMessagingGroupByPlatform('slack', 'C-MENTIONED')).toBeDefined();
   });
 
+  it('names an auto-created DM after the person — "DM <name>" — and never a group', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { getMessagingGroupByPlatform } = await import('./db/messaging-groups.js');
+    const chatSdk = (name: string, text: string): string =>
+      JSON.stringify({ text, author: { userId: 'U-T', fullName: name, userName: 'tereza' } });
+
+    await routeInbound({
+      channelType: 'slack',
+      platformId: 'slack:D-NEW',
+      threadId: null,
+      message: {
+        id: 'msg-dm',
+        kind: 'chat-sdk',
+        content: chatSdk('Tereza Bartoňová', 'ahoj'),
+        timestamp: now(),
+        isMention: true,
+        isGroup: false,
+      },
+    });
+    expect((await getMessagingGroupByPlatform('slack', 'slack:D-NEW'))!.name).toBe('DM Tereza Bartoňová');
+
+    for (const [id, isGroup] of [
+      ['C-GROUP', true],
+      ['C-UNDECLARED', undefined],
+    ] as const) {
+      await routeInbound({
+        channelType: 'slack',
+        platformId: `slack:${id}`,
+        threadId: null,
+        message: {
+          id: `msg-${id}`,
+          kind: 'chat-sdk',
+          content: chatSdk('Tereza Bartoňová', '@bot hi'),
+          timestamp: now(),
+          isMention: true,
+          isGroup,
+        },
+      });
+      expect((await getMessagingGroupByPlatform('slack', `slack:${id}`))!.name).toBeNull();
+    }
+  });
+
   it('deduplicates two concurrent first messages for an unknown channel', async () => {
     const { routeInbound } = await import('./router.js');
     const event = (id: string): InboundEvent => ({

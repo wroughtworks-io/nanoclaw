@@ -34,6 +34,7 @@ import { backfillNewSession, fanInboundMessage } from './modules/cross-session-c
 import { failAck, startAck } from './modules/ack/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { dmNameFromInbound } from './dm-naming.js';
 import {
   dmRequesterFor,
   ensureSessionRequester,
@@ -269,7 +270,12 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       // Persist the receiving instance — without this, the first bot's row
       // would absorb every sibling instance's traffic.
       instance: event.instance ?? event.channelType,
-      name: null,
+      // A DM is named after the person on the other end ("DM Tereza
+      // Bartoňová") — agents see this name, and its destination address
+      // derives from it. Groups stay unnamed here (adapters resolve those).
+      // Only when the adapter says it IS a DM — adapters that leave isGroup
+      // undefined must never get a channel labelled "DM …".
+      name: event.message.isGroup === false ? dmNameFromInbound(event.message.content, event.channelType) : null,
       is_group: event.message.isGroup ? 1 : 0,
       // Policy from the receiving channel's declared defaults (DM vs group
       // context); undeclared adapters resolve through the behavior-faithful

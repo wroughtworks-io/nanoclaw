@@ -335,6 +335,15 @@ export interface ChatSdkBridgeConfig {
    */
   clearTyping?: (threadId: string) => Promise<void>;
   /**
+   * The bot's own human name on the platform (e.g. "Klára"). The SDK resolves
+   * every inline mention to a name EXCEPT the bot's own — it keeps
+   * "@<botUserId>" so mention detection works — so an agent tagged by name
+   * sees an opaque id it does not recognise as itself. When set, the bridge
+   * rewrites "@<botUserId>" to "@<name>" in the inbound text after mention
+   * detection has run. Return null when unknown (text is left unchanged).
+   */
+  resolveSelfName?: () => Promise<string | null>;
+  /**
    * Declared wiring-time defaults for this channel. Copied verbatim onto the
    * returned ChannelAdapter, exactly like supportsThreads. See
    * `ChannelAdapter.defaults`.
@@ -499,6 +508,17 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       serialized.senderId = author.userId;
       serialized.sender = name;
       serialized.senderName = name;
+    }
+
+    // The agent's own tag: "@U0…" → "@Klára". isMention is already decided
+    // (passed in), so rewriting the text cannot affect engagement.
+    const botUserId = (adapter as { botUserId?: string }).botUserId;
+    if (config.resolveSelfName && botUserId && typeof serialized.text === 'string') {
+      const tag = `@${botUserId}`;
+      if (serialized.text.includes(tag)) {
+        const selfName = await config.resolveSelfName().catch(() => null);
+        if (selfName) serialized.text = serialized.text.split(tag).join(`@${selfName}`);
+      }
     }
 
     // Drop raw to save DB space (can be very large)

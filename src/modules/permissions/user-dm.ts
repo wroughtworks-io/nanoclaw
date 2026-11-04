@@ -35,6 +35,7 @@
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { getMessagingGroup, getMessagingGroupByPlatform, createMessagingGroup } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
+import { dmName } from '../../dm-naming.js';
 import type { MessagingGroup, User } from '../../types.js';
 import { getUser } from './db/users.js';
 import { getUserDm, upsertUserDm } from './db/user-dms.js';
@@ -93,7 +94,7 @@ export async function ensureUserDm(
       id: mgId,
       channel_type: channelType,
       platform_id: dmPlatformId,
-      name: user.display_name,
+      name: dmName(user.display_name) ?? user.display_name,
       is_group: 0,
       // Deliberately 'strict', NOT the channel's declared DM policy: this row
       // backs a host-initiated DM to a known privileged user (approver,
