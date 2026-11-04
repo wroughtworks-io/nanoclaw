@@ -8,7 +8,10 @@
  * only when something needs a look — a rerouted reply, or one that bypassed
  * the guard — and on Mondays a one-line "OK" heartbeat, so silence means
  * "nothing happened" rather than "the check stopped". --hours sets the
- * window (default 24). Exit 1 when a notification could not be sent.
+ * window (default 24). --not-before <ISO> floors the window: deliveries made
+ * before the guard was running on this box cannot have been rerouted, and
+ * would otherwise read as "guard bypassed". Exit 1 when a notification could
+ * not be sent.
  */
 import fs from 'fs';
 import path from 'path';
@@ -28,7 +31,13 @@ const notify = process.argv.includes('--notify');
 const heartbeat = process.argv.includes('--heartbeat') || new Date().getDay() === 1;
 
 await initDb(CENTRAL_DB_PATH, { role: 'tool' });
-const since = new Date(Date.now() - hours * 3600_000).toISOString();
+const windowStart = Date.now() - hours * 3600_000;
+const notBefore = arg('--not-before') ? Date.parse(arg('--not-before')!) : NaN;
+if (arg('--not-before') && Number.isNaN(notBefore)) {
+  console.error(`--not-before is not a timestamp: ${arg('--not-before')}`);
+  process.exit(2);
+}
+const since = new Date(Number.isNaN(notBefore) ? windowStart : Math.max(windowStart, notBefore)).toISOString();
 
 let logText = '';
 for (const f of ['nanoclaw.log', 'nanoclaw.error.log']) {
