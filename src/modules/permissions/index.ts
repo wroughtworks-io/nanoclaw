@@ -58,6 +58,7 @@ import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import { declineAndNotify, requestSenderApproval } from './sender-approval.js';
 import { ensureUserDm } from './user-dm.js';
+import { senderFromContent } from '../../sender-identity.js';
 
 // ── Free-text name input state ──
 // Tracks approvers waiting for a text reply with the agent name. Keyed by
@@ -77,25 +78,9 @@ async function extractAndUpsertUser(event: InboundEvent): Promise<string | null>
     return null;
   }
 
-  // chat-sdk-bridge serializes author info as a nested `author.userId` and
-  // does NOT populate top-level `senderId`. Older adapters (v1, native) put
-  // `senderId` or `sender` directly at the top level. Check all three.
-  const senderIdField = typeof content.senderId === 'string' ? content.senderId : undefined;
-  const senderField = typeof content.sender === 'string' ? content.sender : undefined;
-  const author =
-    typeof content.author === 'object' && content.author !== null
-      ? (content.author as Record<string, unknown>)
-      : undefined;
-  const authorUserId = typeof author?.userId === 'string' ? (author.userId as string) : undefined;
-  const senderName =
-    (typeof content.senderName === 'string' ? content.senderName : undefined) ??
-    (typeof author?.fullName === 'string' ? (author.fullName as string) : undefined) ??
-    (typeof author?.userName === 'string' ? (author.userName as string) : undefined);
-
-  const rawHandle = senderIdField ?? senderField ?? authorUserId;
-  if (!rawHandle) return null;
-
-  const userId = rawHandle.includes(':') ? rawHandle : `${event.channelType}:${rawHandle}`;
+  const sender = senderFromContent(content, event.channelType);
+  if (!sender) return null;
+  const { userId, displayName: senderName } = sender;
   if (!(await getUser(userId))) {
     await upsertUser({
       id: userId,

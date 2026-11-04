@@ -27,7 +27,8 @@ import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './sess
 import { resolveAck, setAckAdapter } from './modules/ack/index.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
-import type { PendingApproval, Session } from './types.js';
+import type { MessagingGroup, PendingApproval, Session } from './types.js';
+import { decideReplyRoute, rerouteAlertText } from './reply-routing.js';
 import type { OutboundMessage } from './mailbox/index.js';
 
 const ACTIVE_POLL_MS = 1000;
@@ -242,10 +243,23 @@ async function drainSession(session: Session): Promise<void> {
 
   for (const msg of pending) {
     try {
-      const platformMsgId = await deliverMessage(msg, session);
+      const result = await deliverMessage(msg, session);
+      const platformMsgId = result?.platformMsgId;
       await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) =>
         mailbox.markDelivered(msg.id, platformMsgId ?? null),
       );
+      // Observers see the address the message actually went to — after a
+      // reply-routing reroute that is not the address the agent wrote, and
+      // fanning out to the written one would copy the reply into the wrong
+      // conversation's shared context.
+      const observed = result?.rerouted
+        ? {
+            ...msg,
+            channelType: result.rerouted.channelType,
+            platformId: result.rerouted.platformId,
+            threadId: result.rerouted.threadId,
+          }
+        : msg;
       const firstDelivery = delivered.size === 0;
       delivered.add(msg.id);
       deliveryAttempts.delete(msg.id);
@@ -257,8 +271,8 @@ async function drainSession(session: Session): Promise<void> {
             {
               id: msg.id,
               kind: msg.kind,
-              platform_id: msg.platformId,
-              channel_type: msg.channelType,
+              platform_id: observed.platformId,
+              channel_type: observed.channelType,
               content: msg.content,
             },
             session,
@@ -266,7 +280,7 @@ async function drainSession(session: Session): Promise<void> {
           );
           for (const hook of postDeliveryHooks) {
             try {
-              await hook(msg, session, { firstDelivery });
+              await hook(observed, session, { firstDelivery });
             } catch (err) {
               log.warn('Post-delivery hook failed', { messageId: msg.id, sessionId: session.id, err });
             }
@@ -317,7 +331,7 @@ async function deliverMessage(
     inReplyTo: string | null;
   },
   session: Session,
-): Promise<string | undefined> {
+): Promise<DeliveryResult | undefined> {
   if (!deliveryAdapter) {
     log.warn('No delivery adapter configured, dropping message', { id: msg.id });
     return;
@@ -387,6 +401,10 @@ async function deliverMessage(
   // (instead of marking it delivered when nothing was actually delivered,
   // which was the pre-refactor bug).
   let deliverInstance: string | undefined;
+  // Where this message actually goes. Starts as the agent-written address;
+  // the reply-routing guard may move it back to the conversation it answers.
+  const route = { channelType: msg.channelType, platformId: msg.platformId, threadId: msg.threadId };
+  let reroutedFrom: MessagingGroup | undefined;
   if (msg.channelType && msg.platformId) {
     // Resolve the messaging group ORIGIN-SESSION-FIRST: when the message
     // targets the session's own chat address, the origin row wins even if
@@ -397,7 +415,7 @@ async function deliverMessage(
     // by-platform lookup (default-instance-first) when the sender has no
     // matching destination.
     const originMg = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
-    const mg =
+    let mg =
       originMg && originMg.channel_type === msg.channelType && originMg.platform_id === msg.platformId
         ? originMg
         : ((await getMessagingGroupForOwnDestination(session.agent_group_id, msg.channelType, msg.platformId)) ??
@@ -405,6 +423,34 @@ async function deliverMessage(
     if (!mg) {
       throw new Error(`unknown messaging group for ${msg.channelType}/${msg.platformId} (message ${msg.id})`);
     }
+
+    // Reply-routing guard (src/reply-routing.ts): a reply stays in the
+    // conversation it answers unless the sender is privileged, the origin is
+    // the operator CLI, or the target is an owner's DM. Runs before the
+    // detached and ACL checks so both apply to the final destination.
+    const answered = msg.inReplyTo
+      ? await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+          mailbox.getInboundOrigin(msg.inReplyTo!),
+        )
+      : undefined;
+    const decision = await decideReplyRoute(session, mg, answered);
+    if (decision.action === 'reroute') {
+      log.warn('Cross-conversation reply rerouted to origin', {
+        id: msg.id,
+        sessionId: session.id,
+        agentGroupId: session.agent_group_id,
+        intended: mg.id,
+        deliveredTo: decision.to.id,
+        inReplyTo: msg.inReplyTo,
+        senderUserId: decision.senderUserId,
+      });
+      reroutedFrom = mg;
+      mg = decision.to;
+      route.channelType = mg.channel_type;
+      route.platformId = mg.platform_id;
+      route.threadId = decision.threadId;
+    }
+
     if (mg.detached_at) {
       // The bot was removed from this conversation (a channel membership
       // module stamps detached_at when the bot leaves). Fail into the retry
@@ -451,9 +497,9 @@ async function deliverMessage(
         question_id: content.questionId,
         session_id: session.id,
         message_out_id: msg.id,
-        platform_id: msg.platformId,
-        channel_type: msg.channelType,
-        thread_id: msg.threadId,
+        platform_id: route.platformId,
+        channel_type: route.channelType,
+        thread_id: route.threadId,
         title,
         options: normalizeOptions(rawOptions as never),
         created_at: new Date().toISOString(),
@@ -465,7 +511,7 @@ async function deliverMessage(
   }
 
   // Channel delivery
-  if (!msg.channelType || !msg.platformId) {
+  if (!route.channelType || !route.platformId) {
     log.warn('Message missing routing fields', { id: msg.id });
     return;
   }
@@ -479,9 +525,9 @@ async function deliverMessage(
       : undefined;
 
   const platformMsgId = await deliveryAdapter.deliver(
-    msg.channelType,
-    msg.platformId,
-    msg.threadId,
+    route.channelType,
+    route.platformId,
+    route.threadId,
     msg.kind,
     msg.content,
     files,
@@ -489,15 +535,61 @@ async function deliverMessage(
   );
   log.info('Message delivered', {
     id: msg.id,
-    channelType: msg.channelType,
-    platformId: msg.platformId,
+    channelType: route.channelType,
+    platformId: route.platformId,
     platformMsgId,
     fileCount: files?.length,
   });
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
-  return platformMsgId;
+  if (reroutedFrom) {
+    // Best effort, never awaited by delivery: the reply is already where it belongs.
+    void alertOwnersOfReroute(session, reroutedFrom, route).catch((err) =>
+      log.warn('Reroute owner alert failed', { id: msg.id, sessionId: session.id, err }),
+    );
+  }
+
+  return {
+    platformMsgId,
+    rerouted: reroutedFrom
+      ? { channelType: route.channelType, platformId: route.platformId, threadId: route.threadId }
+      : undefined,
+  };
+}
+
+interface DeliveryResult {
+  platformMsgId: string | undefined;
+  /** Set when the reply-routing guard moved the message; the address it was delivered to. */
+  rerouted?: { channelType: string; platformId: string; threadId: string | null };
+}
+
+async function alertOwnersOfReroute(
+  session: Session,
+  intended: MessagingGroup,
+  route: { channelType: string | null; platformId: string | null },
+): Promise<void> {
+  if (!deliveryAdapter || !route.channelType || !route.platformId) return;
+  if (!(await hasTable(getDb(), 'user_roles'))) return;
+  const deliveredTo = await getMessagingGroupByPlatform(route.channelType, route.platformId);
+  if (!deliveredTo) return;
+  const { getOwners } = await import('./modules/permissions/db/user-roles.js');
+  const { ensureUserDm } = await import('./modules/permissions/user-dm.js');
+  const agentName = (await getAgentGroup(session.agent_group_id))?.name ?? session.agent_group_id;
+  const text = rerouteAlertText(agentName, intended, deliveredTo);
+  for (const owner of await getOwners()) {
+    const dm = await ensureUserDm(owner.user_id);
+    if (!dm) continue;
+    await deliveryAdapter.deliver(
+      dm.channel_type,
+      dm.platform_id,
+      null,
+      'chat',
+      JSON.stringify({ text }),
+      undefined,
+      dm.instance,
+    );
+  }
 }
 
 /**

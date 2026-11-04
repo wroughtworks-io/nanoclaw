@@ -325,6 +325,25 @@ export function getInboundSourceSessionId(db: Database.Database, messageId: stri
 }
 
 /**
+ * Look up the conversation an inbound row arrived from, plus its raw content
+ * (which carries the sender handle). Returns undefined if the row doesn't
+ * exist. Used by delivery's reply-routing guard to decide which conversation
+ * a reply (`in_reply_to`) belongs to and who triggered it.
+ */
+export function getInboundOrigin(
+  db: Database.Database,
+  messageId: string,
+): { channelType: string | null; platformId: string | null; threadId: string | null; content: string } | undefined {
+  return db
+    .prepare(
+      'SELECT channel_type AS channelType, platform_id AS platformId, thread_id AS threadId, content FROM messages_in WHERE id = ?',
+    )
+    .get(messageId) as
+    | { channelType: string | null; platformId: string | null; threadId: string | null; content: string }
+    | undefined;
+}
+
+/**
  * Find the source_session_id of the most recent a2a inbound row from a
  * specific peer (by agent group id). Used as a peer-affinity fallback in
  * a2a routing when an outbound reply has no `in_reply_to` (e.g. the
