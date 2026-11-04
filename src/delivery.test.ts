@@ -40,6 +40,8 @@ import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { log } from './log.js';
+import { grantRole } from './modules/permissions/db/user-roles.js';
+import { upsertUser } from './modules/permissions/db/users.js';
 
 function openInboundDb(agentGroupId: string, sessionId: string): Database.Database {
   return new Database(inboundDbPath(agentGroupId, sessionId));
@@ -75,6 +77,39 @@ function insertOutbound(agentGroupId: string, sessionId: string, msgId: string):
      VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', ?)`,
   ).run(msgId, JSON.stringify({ text: 'hello' }));
   db.close();
+}
+
+/**
+ * Make the session's next outbound a reply to an owner's message. Cross-
+ * conversation sends are only allowed for privileged senders (reply-routing
+ * guard, src/reply-routing.ts); the ACL/instance tests below exercise what
+ * happens after that guard lets a send through.
+ */
+async function seedOwnerQuestion(sessionId: string, inboundId: string): Promise<void> {
+  await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
+  await grantRole({
+    user_id: 'telegram:owner',
+    role: 'owner',
+    agent_group_id: null,
+    granted_by: null,
+    granted_at: now(),
+  });
+  await withMailboxSession('ag-1', sessionId, (mailbox) =>
+    mailbox.insertMessage({
+      id: inboundId,
+      kind: 'chat',
+      timestamp: now(),
+      platformId: 'telegram:123',
+      channelType: 'telegram',
+      threadId: null,
+      content: JSON.stringify({ text: 'please post this', senderId: 'telegram:owner' }),
+      processAfter: null,
+      recurrence: null,
+      trigger: true,
+      sourceSessionId: null,
+      onWake: false,
+    }),
+  );
 }
 
 beforeEach(async () => {
@@ -407,13 +442,14 @@ describe('deliverSessionMessages — permission check', () => {
 
     // Session is on mg-1 (telegram)
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedOwnerQuestion(session.id, 'in-owner');
 
     // Insert an outbound message targeting mg-2 (discord) — not the origin chat
     const outDb = new Database(outboundDbPath('ag-1', session.id));
     outDb
       .prepare(
-        `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
-       VALUES (?, datetime('now'), 'chat', 'discord:456', 'discord', ?)`,
+        `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content, in_reply_to)
+       VALUES (?, datetime('now'), 'chat', 'discord:456', 'discord', ?, 'in-owner')`,
       )
       .run('out-unauth', JSON.stringify({ text: 'sneaky' }));
     outDb.close();
@@ -480,12 +516,13 @@ describe('deliverSessionMessages — permission check', () => {
     // Session origin is mg-1 (telegram) — not the shared room, so the
     // origin-session shortcut doesn't apply here.
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedOwnerQuestion(session.id, 'in-owner');
 
     const outDb = new Database(outboundDbPath('ag-1', session.id));
     outDb
       .prepare(
-        `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
-       VALUES (?, datetime('now'), 'chat', 'discord:999', 'discord', ?)`,
+        `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content, in_reply_to)
+       VALUES (?, datetime('now'), 'chat', 'discord:999', 'discord', ?, 'in-owner')`,
       )
       .run('out-shared-room', JSON.stringify({ text: 'hello room' }));
     outDb.close();
@@ -536,12 +573,13 @@ describe('deliverSessionMessages — permission check', () => {
 
     // Session is on mg-1 (telegram) — not the origin of the broadcast target.
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedOwnerQuestion(session.id, 'in-owner');
 
     const outDb = new Database(outboundDbPath('ag-1', session.id));
     outDb
       .prepare(
-        `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
-       VALUES (?, datetime('now'), 'chat', 'discord:789', 'discord', ?)`,
+        `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content, in_reply_to)
+       VALUES (?, datetime('now'), 'chat', 'discord:789', 'discord', ?, 'in-owner')`,
       )
       .run('out-broadcast', JSON.stringify({ text: 'status update' }));
     outDb.close();

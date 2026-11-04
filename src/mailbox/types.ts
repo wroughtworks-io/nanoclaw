@@ -113,6 +113,10 @@ export interface InboundMailbox {
   markDelivered(messageOutId: string, platformMessageId: string | null): void;
   markDeliveryFailed(messageOutId: string): void;
   getInboundSourceSessionId(messageId: string): string | null;
+  /** The conversation an inbound row arrived from and its raw content; undefined if no such row. */
+  getInboundOrigin(
+    messageId: string,
+  ): { channelType: string | null; platformId: string | null; threadId: string | null; content: string } | undefined;
   getMostRecentPeerSourceSessionId(peerAgentGroupId: string): string | null;
   insertTask(task: Task): Promise<void>;
   cancelTask(taskId?: string): number;
