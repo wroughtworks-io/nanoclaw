@@ -158,6 +158,9 @@ export async function getDestinationReferencers(targetAgentGroupId: string): Pro
 export function normalizeName(name: string): string {
   return (
     name
+      // Transliterate before stripping: "Bartoňová" → "bartonova", not "barto-ov".
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '') || 'unnamed'

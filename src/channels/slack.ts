@@ -166,6 +166,35 @@ interface SdkMessage {
 }
 
 /**
+ * The bot's own Slack name (profile display name, else real name, else
+ * handle), fetched once via users.info with this instance's bot token and
+ * memoised. A failed lookup is not cached, so the next tagged message retries.
+ */
+export function selfNameResolver(
+  botToken: string,
+  botUserId: () => string | undefined,
+  fetchImpl: typeof fetch = fetch,
+): () => Promise<string | null> {
+  let cached: string | null = null;
+  return async () => {
+    if (cached) return cached;
+    const id = botUserId();
+    if (!id) return null;
+    const res = await fetchImpl(`https://slack.com/api/users.info?user=${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${botToken}` },
+    });
+    const body = (await res.json()) as {
+      ok?: boolean;
+      user?: { name?: string; real_name?: string; profile?: { display_name?: string; real_name?: string } };
+    };
+    if (!body.ok || !body.user) return null;
+    const u = body.user;
+    cached = u.profile?.display_name || u.profile?.real_name || u.real_name || u.name || null;
+    return cached;
+  };
+}
+
+/**
  * Fetch Slack history around the engaging message by reusing the Chat SDK
  * adapter's own fetchers (fetchMessages = conversations.replies,
  * fetchChannelMessages = conversations.history). The SDK resolves author
@@ -288,6 +317,7 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
     supportsThreads: true,
     defaults: SLACK_DEFAULTS,
     clearTyping: (threadId) => clearSlackStatus(slackAdapter, threadId),
+    resolveSelfName: selfNameResolver(botToken, () => slackAdapter.botUserId),
   });
   bridge.resolveChannelName = async (platformId: string) => {
     try {
