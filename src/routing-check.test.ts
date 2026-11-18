@@ -190,3 +190,95 @@ describe('routing check', () => {
     expect(formatRoutingCheck(r, 'production', true)).toContain('OK — 2 replies');
   });
 });
+
+describe('routing check — messages nobody heard', () => {
+  async function drop(platformId: string, mgId: string | null, reason: string, sender = 'Pavlína'): Promise<void> {
+    const { recordDroppedMessage } = await import('./db/dropped-messages.js');
+    await recordDroppedMessage({
+      channel_type: 'slack',
+      platform_id: platformId,
+      user_id: null,
+      sender_name: sender,
+      reason,
+      messaging_group_id: mgId,
+      agent_group_id: null,
+    });
+  }
+
+  it('reports a DM still unwired, and stays silent once it is wired', async () => {
+    await dm('mg-dm-pavlina', 'slack:D-PAVLINA', '');
+    await getDb().run(`UPDATE messaging_groups SET instance = 'slack-marta' WHERE id = 'mg-dm-pavlina'`);
+    await drop('slack:D-PAVLINA', 'mg-dm-pavlina', 'no_agent_wired');
+    await drop('slack:D-PAVLINA', 'mg-dm-pavlina', 'no_agent_wired');
+    const since = new Date(Date.now() - 3600_000).toISOString();
+
+    const report = await runRoutingCheck({ since, rerouteLogIds: new Set() });
+    expect(report.dropped).toEqual([
+      expect.objectContaining({
+        who: 'Pavlína',
+        where: 'slack:D-PAVLINA via slack-marta',
+        reason: 'no_agent_wired',
+        count: 2,
+      }),
+    ]);
+    const text = formatRoutingCheck(report, 'production', false)!;
+    expect(text).toContain('🔇 Pavlína → slack:D-PAVLINA via slack-marta: 2 message(s) dropped (no_agent_wired)');
+
+    const { createMessagingGroupAgent } = await import('./db/messaging-groups.js');
+    await createMessagingGroupAgent({
+      id: 'mga-pavlina',
+      messaging_group_id: 'mg-dm-pavlina',
+      agent_group_id: 'ag-1',
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'known',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+    expect((await runRoutingCheck({ since, rerouteLogIds: new Set() })).dropped).toEqual([]);
+  });
+
+  it('ignores unaddressed channel chatter and drops older than the window', async () => {
+    await drop('slack:C-CHATTER', null, 'no_agent_engaged');
+    await drop('slack:D-OLD', null, 'unknown_sender_strict');
+    await getDb().run(
+      `UPDATE unregistered_senders SET last_seen = ? WHERE platform_id = 'slack:D-OLD'`,
+      '2026-01-01T00:00:00.000Z',
+    );
+    const report = await runRoutingCheck({
+      since: new Date(Date.now() - 3600_000).toISOString(),
+      rerouteLogIds: new Set(),
+    });
+    expect(report.dropped).toEqual([]);
+    expect(formatRoutingCheck(report, 'staging', false)).toBeNull();
+  });
+
+  it('flags an approval card unanswered for more than a day, not a fresh one', async () => {
+    const { createPendingChannelApproval } = await import('./modules/permissions/db/pending-channel-approvals.js');
+    await dm('mg-dm-michal', 'slack:D-MICHAL', 'DM Michal');
+    await dm('mg-dm-fresh', 'slack:D-FRESH', 'DM Fresh');
+    const row = (mg: string, created_at: string) => ({
+      messaging_group_id: mg,
+      agent_group_id: 'ag-1',
+      original_message: '{}',
+      approver_user_id: 'slack:U-OWNER',
+      created_at,
+      title: 't',
+      question: 'q',
+      options_json: '[]',
+    });
+    await createPendingChannelApproval(row('mg-dm-michal', '2026-10-12T09:00:00.000Z'));
+    await createPendingChannelApproval(row('mg-dm-fresh', now()));
+
+    const report = await runRoutingCheck({
+      since: new Date(Date.now() - 3600_000).toISOString(),
+      rerouteLogIds: new Set(),
+    });
+    expect(report.stalePending).toEqual([{ where: 'DM Michal', createdAt: '2026-10-12T09:00:00.000Z' }]);
+    expect(formatRoutingCheck(report, 'production', false)).toContain(
+      '⏳ approval card for "DM Michal" pending since 2026-10-12T09:00:00.000Z — unanswered',
+    );
+  });
+});
