@@ -787,6 +787,41 @@ describe('unwired DM: the sender is never left in silence', () => {
   });
 });
 
+describe('the card names the agent the person tried to reach', () => {
+  it('a DM to a per-agent bot instance names that agent in title and question', async () => {
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound({ ...dmEvent('dm-to-andy'), instance: 'telegram-andy' });
+    await vi.waitFor(() => expect(deliverMock).toHaveBeenCalled());
+    const card = JSON.parse(deliverMock.mock.calls[0][4] as string) as { title: string; question: string };
+    expect(card.title).toBe('💬 New direct message to Andy');
+    expect(card.question).toContain('Stranger sent Andy a DM on telegram.');
+  });
+
+  it('the default instance keeps the generic wording', async () => {
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(dmEvent('dm-default'));
+    await vi.waitFor(() => expect(deliverMock).toHaveBeenCalled());
+    const card = JSON.parse(deliverMock.mock.calls[0][4] as string) as { title: string; question: string };
+    expect(card.title).toBe('💬 New direct message');
+    expect(card.question).toContain('sent your bot a DM');
+  });
+
+  it('matches instance to agent without case or diacritics, falls back to the instance', async () => {
+    const { agentLabelForInstance } = await import('./channel-approval.js');
+    const groups = [
+      { name: 'Klára', folder: 'kl-ra' },
+      { name: 'Věra', folder: 'v-ra' },
+      { name: 'Marta', folder: 'marta' },
+    ];
+    expect(agentLabelForInstance('slack-klara', 'slack', groups)).toBe('Klára');
+    expect(agentLabelForInstance('slack-vera', 'slack', groups)).toBe('Věra');
+    expect(agentLabelForInstance('slack-marta', 'slack', groups)).toBe('Marta');
+    expect(agentLabelForInstance('slack-radek', 'slack', groups)).toBe('slack-radek');
+    expect(agentLabelForInstance('slack', 'slack', groups)).toBeNull();
+    expect(agentLabelForInstance(null, 'slack', groups)).toBeNull();
+  });
+});
+
 describe('unwired-DM copy', () => {
   it('builds the wire-dm command from a slack instance and user id', async () => {
     const { unwiredDmFyiText, unwiredDmDeclineText } = await import('./index.js');
