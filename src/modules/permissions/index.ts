@@ -45,6 +45,7 @@ import {
   NEW_AGENT_VALUE,
   REJECT_VALUE,
   requestChannelApproval,
+  type ChannelApprovalOutcome,
 } from './channel-approval.js';
 import { addMember } from './db/agent-group-members.js';
 import {
@@ -56,7 +57,7 @@ import {
 import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pending-sender-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
-import { declineAndNotify, requestSenderApproval } from './sender-approval.js';
+import { declineAndNotify, ownerDisplayName, requestSenderApproval } from './sender-approval.js';
 import { ensureUserDm } from './user-dm.js';
 import { senderFromContent } from '../../sender-identity.js';
 
@@ -335,8 +336,65 @@ setChannelRequestGate(async (mg, event) => {
     // need the id, and an interceptor that does will decline to act on null.
     log.warn('Channel escalation: could not resolve the triggering sender', { messagingGroupId: mg.id, err });
   }
-  await requestChannelApproval({ messagingGroupId: mg.id, event, senderUserId });
+  const outcome = await requestChannelApproval({ messagingGroupId: mg.id, event, senderUserId });
+  await noticeUnwiredDm(mg, event, senderUserId, outcome);
 });
+
+// ── Unwired-DM notice ──
+// Without this, a DM to an agent nobody wired is dropped silently: the
+// person hears nothing and, unless a card got through, neither does the
+// owner. A staff member once wrote two agents twelve times over a month
+// before anyone knew. Every outcome except 'handled' leaves the message
+// undelivered, so the sender is told; the owner is told too unless an
+// approval card already reached them. DMs only — a decline posted into a
+// channel would be public. declineAndNotify dedupes per sender and
+// conversation for 24 h, so a sender writing ten times gets one reply.
+
+/** Sender-facing copy. Gender-neutral on purpose: the agents are Klára,
+ *  Věra and Marta, and the sentence must not depend on who says it. */
+export function unwiredDmDeclineText(owner: string | null): string {
+  return `Zatím ke mně nemáte přístup. Žádost o přístup byla předána správci${owner ? ` (${owner})` : ''}.`;
+}
+
+/** Owner-facing one-liner, with the command that grants access. */
+export function unwiredDmFyiText(who: string, instance: string | null, senderUserId: string | null): string {
+  const agent = instance ? instance.replace(/^slack-/, '') : null;
+  const handle = senderUserId ? senderUserId.replace(/^[a-z]+:/, '') : null;
+  const allow =
+    agent && handle
+      ? ` Allow: node pipeline/wire-dm.mjs ${agent} <env> ${handle}`
+      : ' Allow them with `ncl members add`.';
+  return `FYI: ${who} DMed ${agent ?? 'an agent'} but is not wired — they got a polite "no access yet" reply.${allow}`;
+}
+
+async function noticeUnwiredDm(
+  mg: MessagingGroup,
+  event: InboundEvent,
+  senderUserId: string | null,
+  outcome: ChannelApprovalOutcome,
+): Promise<void> {
+  if (outcome === 'handled') return;
+  const isGroup = event.message?.isGroup ?? mg.is_group === 1;
+  if (isGroup) return;
+  try {
+    const parsed = safeParseContent(event.message.content);
+    const senderName = parsed.sender ?? null;
+    const who =
+      senderName && senderUserId ? `${senderName} (${senderUserId})` : (senderName ?? senderUserId ?? 'Someone');
+    await declineAndNotify({
+      messagingGroupId: mg.id,
+      agentGroupId: null,
+      senderIdentity: senderUserId,
+      senderName,
+      event,
+      declineText: unwiredDmDeclineText(await ownerDisplayName()),
+      fyiText: unwiredDmFyiText(who, mg.instance ?? null, senderUserId),
+      notifyOwner: outcome !== 'carded',
+    });
+  } catch (err) {
+    log.error('Unwired-DM notice failed', { messagingGroupId: mg.id, outcome, err });
+  }
+}
 
 /**
  * Wire an approved channel to an agent group and replay the stored event.

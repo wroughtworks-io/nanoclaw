@@ -200,8 +200,8 @@ describe('unknown-channel registration flow', () => {
   it('delivers a card on DM too (non-threaded event)', async () => {
     const { routeInbound } = await import('../../router.js');
     await expectAsyncDelivery(() => routeInbound(dmEvent('dm-new-user')));
-
-    expect(deliverMock).toHaveBeenCalledTimes(1);
+    // Card to the owner, then the "no access yet" line to the sender.
+    await vi.waitFor(() => expect(deliverMock).toHaveBeenCalledTimes(2));
     const payload = JSON.parse(deliverMock.mock.calls[0][4] as string) as { question: string };
     expect(payload.question).toContain('will respond to all messages');
     const count = await countRows('SELECT COUNT(*) AS c FROM pending_channel_approvals');
@@ -704,6 +704,96 @@ describe('unknown-channel registration flow', () => {
     expect(agentGroupsAfter).toBe(agentGroupsBefore);
     const mgaCount = await countRows('SELECT COUNT(*) AS c FROM messaging_group_agents');
     expect(mgaCount).toBe(0);
+  });
+});
+
+describe('unwired DM: the sender is never left in silence', () => {
+  const texts = () =>
+    deliverMock.mock.calls.map((c) => ({
+      to: c[1] as string,
+      body: JSON.parse(c[4] as string) as Record<string, unknown>,
+    }));
+
+  it('carded DM → card to the owner, Czech notice to the sender, no extra FYI', async () => {
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(dmEvent('dm-carded'));
+    await vi.waitFor(() => expect(deliverMock).toHaveBeenCalledTimes(2));
+    await new Promise((r) => setTimeout(r, 20));
+
+    const sent = texts();
+    expect(sent).toHaveLength(2);
+    expect(sent[0].to).toBe('dm-owner');
+    expect(sent[0].body.type).toBe('ask_question');
+    expect(sent[1].to).toBe('dm-carded');
+    expect(sent[1].body.text).toBe('Zatím ke mně nemáte přístup. Žádost o přístup byla předána správci (Owner).');
+  });
+
+  it('a second DM while the card is pending gets no repeat (24 h dedupe)', async () => {
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(dmEvent('dm-twice'));
+    await vi.waitFor(() => expect(deliverMock).toHaveBeenCalledTimes(2));
+    await routeInbound(dmEvent('dm-twice', 'still there?'));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(deliverMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('a stale pending row (> 24 h) expires: the flow runs again and re-cards', async () => {
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chat-stale'));
+    await vi.waitFor(() => expect(deliverMock).toHaveBeenCalledTimes(1));
+    const old = new Date(Date.now() - 25 * 3_600_000).toISOString();
+    await getDb().run('UPDATE pending_channel_approvals SET created_at = ?', old);
+
+    await routeInbound(groupMention('chat-stale', '@bot anyone?'));
+    await vi.waitFor(() => expect(deliverMock).toHaveBeenCalledTimes(2));
+    expect(texts()[1].body.type).toBe('ask_question');
+    const row = await getDb().get<{ created_at: string }>('SELECT created_at FROM pending_channel_approvals');
+    expect(row!.created_at > old).toBe(true);
+  });
+
+  it('a fresh pending row in a group still dedupes, and nothing is posted into the channel', async () => {
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chat-quiet'));
+    await vi.waitFor(() => expect(deliverMock).toHaveBeenCalledTimes(1));
+    await routeInbound(groupMention('chat-quiet', '@bot again'));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(texts().some((t) => t.to === 'chat-quiet')).toBe(false);
+  });
+
+  it('nobody to card (no approver DM) → sender notice anyway; FYI attempted but has nowhere to go', async () => {
+    await getDb().run('DELETE FROM user_dms');
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(dmEvent('dm-no-approver-dm'));
+    await vi.waitFor(() => expect(deliverMock).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 20));
+    const sent = texts();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].to).toBe('dm-no-approver-dm');
+    expect(String(sent[0].body.text)).toMatch(/^Zatím ke mně nemáte přístup\./);
+  });
+
+  it('owner FYI names the agent and the wire-dm command when the card cannot go out', async () => {
+    const { routeInbound } = await import('../../router.js');
+    await getDb().run(`UPDATE messaging_groups SET instance = 'telegram' WHERE id = 'mg-dm-owner'`);
+    // First delivery (the card) fails → outcome 'failed' → sender notice + FYI.
+    deliverMock.mockRejectedValueOnce(new Error('card down'));
+    await routeInbound(dmEvent('dm-card-failed'));
+    await vi.waitFor(() => expect(deliverMock).toHaveBeenCalledTimes(3));
+    const sent = texts();
+    expect(sent[1].to).toBe('dm-card-failed');
+    expect(sent[2].to).toBe('dm-owner');
+    expect(String(sent[2].body.text)).toContain('is not wired');
+  });
+});
+
+describe('unwired-DM copy', () => {
+  it('builds the wire-dm command from a slack instance and user id', async () => {
+    const { unwiredDmFyiText, unwiredDmDeclineText } = await import('./index.js');
+    expect(unwiredDmFyiText('Pavlína (slack:U0C96PGK3MX)', 'slack-marta', 'slack:U0C96PGK3MX')).toBe(
+      'FYI: Pavlína (slack:U0C96PGK3MX) DMed marta but is not wired — they got a polite "no access yet" reply. Allow: node pipeline/wire-dm.mjs marta <env> U0C96PGK3MX',
+    );
+    expect(unwiredDmDeclineText(null)).toBe('Zatím ke mně nemáte přístup. Žádost o přístup byla předána správci.');
   });
 });
 

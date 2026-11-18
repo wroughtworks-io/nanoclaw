@@ -5,8 +5,9 @@
  *   pnpm exec tsx scripts/routing-check.ts --env staging --notify     # + DM the owner when needed
  *
  * --notify DMs every owner (their cached Slack DM, through that DM's own bot)
- * only when something needs a look — a rerouted reply, or one that bypassed
- * the guard — and on Mondays a one-line "OK" heartbeat, so silence means
+ * only when something needs a look — a rerouted reply, one that bypassed
+ * the guard, messages dropped with nobody hearing them, or an approval card
+ * unanswered for over a day — and on Mondays a one-line "OK" heartbeat, so silence means
  * "nothing happened" rather than "the check stopped". --hours sets the
  * window (default 24). --not-before <ISO> floors the window: deliveries made
  * before the guard was running on this box cannot have been rerouted, and
@@ -45,7 +46,15 @@ for (const f of ['nanoclaw.log', 'nanoclaw.error.log']) {
   if (fs.existsSync(p)) logText += fs.readFileSync(p, 'utf8') + '\n';
 }
 const report = await runRoutingCheck({ since, rerouteLogIds: reroutedIdsFromLog(logText) });
-console.log(JSON.stringify({ ...report, rerouted: report.rerouted.length, bypassed: report.bypassed.length }));
+console.log(
+  JSON.stringify({
+    ...report,
+    rerouted: report.rerouted.length,
+    bypassed: report.bypassed.length,
+    dropped: report.dropped?.length ?? 0,
+    stalePending: report.stalePending?.length ?? 0,
+  }),
+);
 
 const text = formatRoutingCheck(report, env, heartbeat);
 if (!text) process.exit(0);

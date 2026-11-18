@@ -192,7 +192,7 @@ export const DECLINE_NOTIFY_DEDUPE_MS = 24 * 60 * 60 * 1000;
 const UNKNOWN_SENDER_KEY = 'unknown';
 
 /** First owner with a display_name, for the decline copy. */
-async function ownerDisplayName(): Promise<string | null> {
+export async function ownerDisplayName(): Promise<string | null> {
   for (const owner of await getOwners()) {
     const name = (await getUser(owner.user_id))?.display_name;
     if (name && name.length > 0) return name;
@@ -213,6 +213,9 @@ export interface DeclineAndNotifyInput {
   declineText?: string;
   /** Override the owner-facing FYI copy. */
   fyiText?: string;
+  /** False when the owner already heard by other means (e.g. a delivered
+   *  approval card): the sender still gets the decline, the FYI is skipped. */
+  notifyOwner?: boolean;
 }
 
 /**
@@ -277,6 +280,11 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     );
   } catch (err) {
     log.warn('decline_notify: decline delivery failed', { messagingGroupId, err });
+  }
+
+  if (input.notifyOwner === false) {
+    log.info('decline_notify handled — decline sent, owner FYI not needed', { messagingGroupId, senderIdentity });
+    return;
   }
 
   // (b) Owner FYI — informational one-liner through the same approver-DM

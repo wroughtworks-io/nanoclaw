@@ -6,7 +6,13 @@
  * host log: a reply the rule says must be rerouted, with no matching
  * "Cross-conversation reply rerouted to origin" warning, means it was
  * delivered by a path that bypassed the guard — the one thing a runtime guard
- * cannot report about itself. Read-only on every database.
+ * cannot report about itself.
+ *
+ * It also reports messages nobody received: senders whose messages were
+ * dropped in the window (unregistered_senders — except unaddressed channel
+ * chatter, and except conversations wired since), and channel-approval cards
+ * pending longer than a day. Both used to fail silently for weeks.
+ * Read-only on every database.
  */
 import fs from 'fs';
 
@@ -33,7 +39,13 @@ export interface RoutingCheckReport {
   rerouted: Array<{ id: string; agent: string; from: string; intended: string }>;
   /** Replies the rule says must be rerouted, with no reroute in the log — guard bypassed. */
   bypassed: Array<{ id: string; agent: string; from: string; intended: string }>;
+  /** Senders with messages dropped in the window that still reach nobody. */
+  dropped?: Array<{ who: string; where: string; reason: string; count: number; lastSeen: string }>;
+  /** Channel-approval cards pending longer than STALE_PENDING_HOURS. */
+  stalePending?: Array<{ where: string; createdAt: string }>;
 }
+
+export const STALE_PENDING_HOURS = 24;
 
 /** Ids of messages the host logged as rerouted (any log format that carries id="…"). */
 export function reroutedIdsFromLog(logText: string): Set<string> {
@@ -46,18 +58,88 @@ export function reroutedIdsFromLog(logText: string): Set<string> {
   return ids;
 }
 
+/** " via <instance>" for a named adapter instance; nothing for the default one. */
+const via = (instance: string | null, channelType: string | null): string =>
+  instance && instance !== channelType ? ` via ${instance}` : '';
+
 const label = (mg: MessagingGroup | undefined): string =>
   mg ? mg.name || `${mg.channel_type}/${mg.platform_id}` : '?';
 
 export async function runRoutingCheck(opts: {
   since: string;
   rerouteLogIds: Set<string>;
+  /** Clock for the stale-pending cutoff (tests). */
+  now?: number;
 }): Promise<RoutingCheckReport> {
   const db = getDb();
   const agents = new Map(
     (await db.all<{ id: string; name: string }>('SELECT id, name FROM agent_groups')).map((a) => [a.id, a.name]),
   );
-  const report: RoutingCheckReport = { since: opts.since, delivered: 0, allowed: {}, rerouted: [], bypassed: [] };
+  const report: RoutingCheckReport = {
+    since: opts.since,
+    delivered: 0,
+    allowed: {},
+    rerouted: [],
+    bypassed: [],
+    dropped: [],
+    stalePending: [],
+  };
+
+  // Dropped and still unheard. no_agent_engaged is ordinary channel chatter
+  // nobody addressed; a no_agent_wired conversation wired since then is solved.
+  const dropped = await db.all<{
+    sender_name: string | null;
+    user_id: string | null;
+    platform_id: string;
+    reason: string;
+    message_count: number;
+    last_seen: string;
+    mg_name: string | null;
+    instance: string | null;
+    channel_type: string;
+  }>(
+    `SELECT u.sender_name, u.user_id, u.platform_id, u.reason, u.message_count, u.last_seen,
+            m.name AS mg_name, m.instance, u.channel_type
+       FROM unregistered_senders u
+       LEFT JOIN messaging_groups m ON m.id = u.messaging_group_id
+      WHERE u.reason != 'no_agent_engaged'
+        AND datetime(u.last_seen) >= datetime(?)
+        AND NOT (u.reason = 'no_agent_wired' AND EXISTS (
+              SELECT 1 FROM messaging_group_agents w WHERE w.messaging_group_id = u.messaging_group_id))
+      ORDER BY u.last_seen DESC`,
+    opts.since,
+  );
+  for (const d of dropped) {
+    report.dropped!.push({
+      who: d.sender_name ?? d.user_id ?? 'unknown sender',
+      where: `${d.mg_name || d.platform_id}${via(d.instance, d.channel_type)}`,
+      reason: d.reason,
+      count: d.message_count,
+      lastSeen: d.last_seen,
+    });
+  }
+
+  const staleBefore = new Date((opts.now ?? Date.now()) - STALE_PENDING_HOURS * 3600_000).toISOString();
+  const pending = await db.all<{
+    created_at: string;
+    platform_id: string | null;
+    name: string | null;
+    instance: string | null;
+    channel_type: string | null;
+  }>(
+    `SELECT p.created_at, m.platform_id, m.name, m.instance, m.channel_type
+       FROM pending_channel_approvals p
+       LEFT JOIN messaging_groups m ON m.id = p.messaging_group_id
+      WHERE datetime(p.created_at) < datetime(?)
+      ORDER BY p.created_at`,
+    staleBefore,
+  );
+  for (const p of pending) {
+    report.stalePending!.push({
+      where: `${p.name || p.platform_id || '?'}${via(p.instance, p.channel_type)}`,
+      createdAt: p.created_at,
+    });
+  }
 
   for (const session of await db.all<Session>('SELECT * FROM sessions')) {
     const inPath = inboundDbPath(session.agent_group_id, session.id);
@@ -129,6 +211,12 @@ export function formatRoutingCheck(report: RoutingCheckReport, env: string, hear
   }
   for (const r of report.rerouted) {
     lines.push(`↩︎ ${r.agent}: reply ${r.id} addressed to "${r.intended}" was kept in "${r.from}"`);
+  }
+  for (const d of report.dropped ?? []) {
+    lines.push(`🔇 ${d.who} → ${d.where}: ${d.count} message(s) dropped (${d.reason}), last ${d.lastSeen}`);
+  }
+  for (const p of report.stalePending ?? []) {
+    lines.push(`⏳ approval card for "${p.where}" pending since ${p.createdAt} — unanswered`);
   }
   if (lines.length > 0) {
     return [`Routing check (${env}, since ${report.since}): ${report.delivered} replies`, ...lines].join('\n');

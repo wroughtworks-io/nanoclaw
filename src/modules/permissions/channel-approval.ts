@@ -35,8 +35,13 @@
  *     escalating on this channel until an admin explicitly re-wires
  *   - Delete the pending row
  *
- * Dedup: `pending_channel_approvals` PK on messaging_group_id. Second
- * mention while pending silently dropped.
+ * Dedup: `pending_channel_approvals` PK on messaging_group_id. A second
+ * mention while a card is pending is not re-carded. A row older than
+ * PENDING_CHANNEL_APPROVAL_TTL_MS is stale — an unanswered card must not
+ * silence a conversation forever — and is deleted so the flow runs again.
+ *
+ * The result tells the caller what happened, so it can tell the sender:
+ * every outcome except 'handled' leaves the message undelivered.
  *
  * Failure modes (log + no row, so a future attempt can try again):
  *   - No agent groups exist (install never set up a first agent).
@@ -59,7 +64,7 @@ import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import {
   createPendingChannelApproval,
   deletePendingChannelApproval,
-  hasInFlightChannelApproval,
+  getPendingChannelApproval,
 } from './db/pending-channel-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 
@@ -217,12 +222,35 @@ export interface RequestChannelApprovalInput {
   senderUserId?: string | null;
 }
 
-export async function requestChannelApproval(input: RequestChannelApprovalInput): Promise<void> {
+/** A pending channel card older than this no longer blocks the conversation. */
+export const PENDING_CHANNEL_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * What requestChannelApproval did with the message:
+ *   handled   — an interceptor took it (e.g. auto-wired); it is delivered.
+ *   carded    — an approval card reached an approver; the message waits.
+ *   in_flight — a fresh card is already pending; not re-carded.
+ *   skipped   — no agent group, approver or approver DM; nobody was asked.
+ *   failed    — the card could not be delivered.
+ */
+export type ChannelApprovalOutcome = 'handled' | 'carded' | 'in_flight' | 'skipped' | 'failed';
+
+export async function requestChannelApproval(input: RequestChannelApprovalInput): Promise<ChannelApprovalOutcome> {
   const { messagingGroupId, event, senderUserId = null } = input;
 
-  if (await hasInFlightChannelApproval(messagingGroupId)) {
-    log.debug('Channel registration already in flight — dropping retry', { messagingGroupId });
-    return;
+  const pending = await getPendingChannelApproval(messagingGroupId);
+  if (pending) {
+    const ageMs = Date.now() - new Date(pending.created_at).getTime();
+    if (!(ageMs >= PENDING_CHANNEL_APPROVAL_TTL_MS)) {
+      log.debug('Channel registration already in flight — not re-carding', { messagingGroupId });
+      return 'in_flight';
+    }
+    log.info('Stale channel registration expired — running the flow again', {
+      messagingGroupId,
+      createdAt: pending.created_at,
+      ageHours: Math.round(ageMs / 3_600_000),
+    });
+    await deletePendingChannelApproval(messagingGroupId);
   }
 
   const originMg = await getMessagingGroup(messagingGroupId);
@@ -239,7 +267,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
           messagingGroupId,
           channelType: originMg.channel_type,
         });
-        return;
+        return 'handled';
       }
     } catch (err) {
       log.warn('Channel-card interceptor threw — falling back to the card', { messagingGroupId, err });
@@ -251,7 +279,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     log.warn('Channel registration skipped — no agent groups configured. Run /init-first-agent.', {
       messagingGroupId,
     });
-    return;
+    return 'skipped';
   }
   // Use first agent group for approver resolution — owners and global admins
   // are returned regardless of which group we pass.
@@ -263,7 +291,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       messagingGroupId,
       targetAgentGroupId: referenceGroup.id,
     });
-    return;
+    return 'skipped';
   }
 
   const originChannelType = originMg?.channel_type ?? '';
@@ -291,7 +319,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       messagingGroupId,
       targetAgentGroupId: referenceGroup.id,
     });
-    return;
+    return 'skipped';
   }
 
   const isGroup = event.message?.isGroup ?? originMg?.is_group === 1;
@@ -332,7 +360,8 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   const adapter = getDeliveryAdapter();
   if (!adapter) {
     log.error('Channel registration row created but no delivery adapter is wired', { messagingGroupId });
-    return;
+    await deletePendingChannelApproval(messagingGroupId);
+    return 'failed';
   }
 
   try {
@@ -358,12 +387,14 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       agentGroupCount: agentGroups.length,
       approver: delivery.userId,
     });
+    return 'carded';
   } catch (err) {
     log.error('Channel registration card delivery failed', { messagingGroupId, err });
     // Nobody saw the card, so nobody can answer it. Left in place, the row
     // trips the in-flight dedupe above and silences every later mention —
     // an admin's included — before the interceptor can auto-wire.
     await deletePendingChannelApproval(messagingGroupId);
+    return 'failed';
   }
 }
 
