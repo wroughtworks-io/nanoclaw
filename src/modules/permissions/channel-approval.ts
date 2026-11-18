@@ -171,20 +171,50 @@ async function buildApprovalOptions(agentGroups: AgentGroup[], approverUserId?: 
   return options;
 }
 
+/**
+ * The agent behind the bot that received the message, from the messaging
+ * group's adapter instance. On a box with one Slack app per agent, the
+ * owner's card arrives through whichever bot owns the owner's DM — so without
+ * this the card cannot say which agent the person tried to reach, and the
+ * owner cannot tell what he is approving. Instance "slack-marta" matches the
+ * agent group named "Marta"; names compare without case or diacritics
+ * ("slack-klara" ↔ "Klára"). Null on the default instance (one bot for all).
+ */
+export function agentLabelForInstance(
+  instance: string | null | undefined,
+  channelType: string,
+  agentGroups: Array<Pick<AgentGroup, 'name' | 'folder'>>,
+): string | null {
+  if (!instance || instance === channelType) return null;
+  const suffix = instance.startsWith(`${channelType}-`) ? instance.slice(channelType.length + 1) : instance;
+  const norm = (v: string): string =>
+    v
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '');
+  const key = norm(suffix);
+  const match = agentGroups.find((g) => norm(g.name) === key) ?? agentGroups.find((g) => norm(g.folder) === key);
+  return match?.name ?? instance;
+}
+
 function buildQuestionText(
   isGroup: boolean,
   senderName: string | undefined,
   channelName: string | null,
   channelType: string,
   ruleNote: string | null,
+  agentLabel: string | null = null,
 ): string {
   const who = senderName ?? 'Someone';
+  const bot = agentLabel ?? 'your bot';
   const note = ruleNote ? ` If connected, the agent ${ruleNote}.` : '';
   if (isGroup) {
     const where = channelName ? `${channelName} on ${channelType}` : `a ${channelType} channel`;
-    return `${who} mentioned your bot in ${where}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle this channel?`;
+    return `${who} mentioned ${bot} in ${where}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle this channel?`;
   }
-  return `${who} sent your bot a DM on ${channelType}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle it?`;
+  return `${who} sent ${bot} a DM on ${channelType}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle it?`;
 }
 
 /**
@@ -333,7 +363,10 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   }
 
   const channelName = originMg?.name ?? null;
-  const title = isGroup ? '📣 Bot mentioned in new channel' : '💬 New direct message';
+  const agentLabel = agentLabelForInstance(originMg?.instance, originChannelType, agentGroups);
+  const title = isGroup
+    ? `📣 ${agentLabel ?? 'Bot'} mentioned in new channel`
+    : `💬 New direct message${agentLabel ? ` to ${agentLabel}` : ''}`;
   // Preview the engage rule an approval would create. The reference group's
   // name only feeds {name} pattern substitution — a best-effort preview when
   // the approver ends up picking a different agent.
@@ -343,7 +376,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     referenceGroup.name,
     originChannelType,
   );
-  const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, ruleNote);
+  const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, ruleNote, agentLabel);
   const options = normalizeOptions(await buildApprovalOptions(agentGroups, delivery.userId));
 
   await createPendingChannelApproval({
