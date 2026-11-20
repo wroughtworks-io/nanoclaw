@@ -32,7 +32,7 @@ import { createDestination } from './modules/agent-to-agent/db/agent-destination
 import { grantRole } from './modules/permissions/db/user-roles.js';
 import { upsertUser } from './modules/permissions/db/users.js';
 import { upsertUserDm } from './modules/permissions/db/user-dms.js';
-import { formatRoutingCheck, reroutedIdsFromLog, runRoutingCheck } from './routing-check.js';
+import { formatRoutingCheck, REROUTE_LOG_MESSAGE, reroutedIdsFromLog, runRoutingCheck } from './routing-check.js';
 import type { Session } from './types.js';
 
 const now = (): string => new Date().toISOString();
@@ -158,6 +158,22 @@ describe('routing check', () => {
     const line =
       '[17:27:39.530] WARN Cross-conversation reply rerouted to origin id="out-1" sessionId="sess-9" intended="mg-c"';
     expect([...reroutedIdsFromLog(`noise\n${line}\n[x] INFO Message delivered id="out-2"`)]).toEqual(['out-1']);
+  });
+
+  it('parses rerouted ids from a line written by the host logger itself (ANSI colours)', async () => {
+    const { log } = await import('./log.js');
+    let written = '';
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      written += String(chunk);
+      return true;
+    });
+    try {
+      log.warn(REROUTE_LOG_MESSAGE, { id: 'msg-real-1', sessionId: 'sess-9', intended: 'mg-cli' });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(written).toContain('\x1b[');
+    expect([...reroutedIdsFromLog(written)]).toEqual(['msg-real-1']);
   });
 
   it('a misaddressed reply the host rerouted is reported as rerouted', async () => {

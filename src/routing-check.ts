@@ -47,10 +47,15 @@ export interface RoutingCheckReport {
 
 export const STALE_PENDING_HOURS = 24;
 
-/** Ids of messages the host logged as rerouted (any log format that carries id="…"). */
+/**
+ * Ids of messages the host logged as rerouted (any log format that carries id="…").
+ * src/log.ts wraps level, message and every key in ANSI colour codes, so they are
+ * stripped first — with them in place `id` is never followed by `=`.
+ */
 export function reroutedIdsFromLog(logText: string): Set<string> {
   const ids = new Set<string>();
-  for (const line of logText.split('\n')) {
+  // eslint-disable-next-line no-control-regex
+  for (const line of logText.replace(/\x1b\[[0-9;]*m/g, '').split('\n')) {
     if (!line.includes(REROUTE_LOG_MESSAGE)) continue;
     const m = line.match(/\bid[=:]\s*"?([^"\s,}]+)"?/);
     if (m) ids.add(m[1]!);
